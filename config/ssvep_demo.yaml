@@ -31,6 +31,14 @@ commands:
   "12": FORWARD
   "15": STOP
 
+control:
+  confidence_threshold: 0.60
+  confirmations_required: 2
+  max_confirmation_gap_s: 1.0
+  command_duration_s: 0.5
+  input_timeout_s: 1.0
+  max_prediction_age_s: 0.5
+
 ui:
   # Null selects the bundled Noto Sans CJK SC font. A relative override path
   # is resolved relative to this YAML file, never the process working directory.

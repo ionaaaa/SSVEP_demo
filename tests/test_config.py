@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from ssvep_demo.config import load_config
+from ssvep_demo.control import ControlCommand
 from ssvep_demo.exceptions import ConfigurationError
 from ssvep_demo.protocol import CANONICAL_CHANNELS
 
@@ -25,11 +26,14 @@ def test_load_demo_config() -> None:
     assert config.stimulus.cue_duration_s == 1.0
     assert config.stimulus.window_size == (1200, 800)
     assert config.ui.cjk_font_file is None
+    assert config.commands[8.0] is ControlCommand.LEFT
+    assert config.control.confirmations_required == 2
 
 
 def test_old_config_without_visual_fields_uses_stimulus_defaults(tmp_path: Path) -> None:
     config = _base_config()
     config.pop("ui")
+    config.pop("control")
     for field in (
         "cue_duration_s", "trial_order", "random_seed", "fullscreen", "window_size", "screen_index",
         "background_color", "stimulus_on_color", "stimulus_off_color", "dropped_frame_threshold_ratio",
@@ -42,6 +46,7 @@ def test_old_config_without_visual_fields_uses_stimulus_defaults(tmp_path: Path)
     assert loaded.stimulus.trial_order == "fixed"
     assert loaded.stimulus.dropped_frame_threshold_ratio == 1.5
     assert loaded.ui.cjk_font_file is None
+    assert loaded.control.command_duration_s == 0.5
 
 
 def test_load_config_accepts_optional_cjk_font_override(tmp_path: Path) -> None:
@@ -65,6 +70,8 @@ def test_load_config_accepts_optional_cjk_font_override(tmp_path: Path) -> None:
         (lambda config: config["decoder"].update(type="trca"), "must be either"),
         (lambda config: config["decoder"].update(bandpass_hz=[6, 125]), "Nyquist"),
         (lambda config: config.update(commands={"8": "LEFT"}), "every and only"),
+        (lambda config: config["commands"].update({"8": "BACKWARD"}), "known control commands"),
+        (lambda config: config["control"].update(confirmations_required=0), "positive integer"),
         (lambda config: config["stimulus"].update(trial_order="shuffle"), "trial_order"),
         (lambda config: config["stimulus"].update(window_size=[0, 800]), "window_size"),
         (lambda config: config["stimulus"].update(background_color=[2, 0, 0]), "between -1 and 1"),

@@ -10,6 +10,7 @@ from typing import Any, Mapping
 import yaml
 
 from .exceptions import ConfigurationError
+from .control import ControlCommand, ControlConfig
 from .protocol import CANONICAL_CHANNELS
 
 
@@ -57,8 +58,9 @@ class DemoConfig:
     stimulus: StimulusConfig
     acquisition: AcquisitionConfig
     decoder: DecoderConfig
-    commands: dict[float, str]
+    commands: dict[float, ControlCommand]
     ui: UIConfig = field(default_factory=UIConfig)
+    control: ControlConfig = field(default_factory=ControlConfig)
 
 
 def _mapping(value: Any, field_name: str) -> Mapping[str, Any]:
@@ -133,6 +135,7 @@ def load_config(path: str | Path) -> DemoConfig:
     decoder_data = _mapping(_required(root, "decoder", "root"), "decoder")
     commands_data = _mapping(_required(root, "commands", "root"), "commands")
     ui_data = _mapping(_optional(root, "ui", {}), "ui")
+    control_data = _mapping(_optional(root, "control", {}), "control")
 
     frequencies_value = _required(stimulus_data, "frequencies", "stimulus")
     if not isinstance(frequencies_value, list) or not frequencies_value:
@@ -209,7 +212,7 @@ def load_config(path: str | Path) -> DemoConfig:
     if bandpass_hz[1] >= sample_rate_hz / 2:
         raise ConfigurationError("decoder.bandpass_hz upper bound must be below the Nyquist frequency")
 
-    commands: dict[float, str] = {}
+    commands: dict[float, ControlCommand] = {}
     for raw_frequency, command in commands_data.items():
         try:
             frequency = float(raw_frequency)
@@ -217,8 +220,12 @@ def load_config(path: str | Path) -> DemoConfig:
             raise ConfigurationError("commands keys must be numeric stimulus frequencies") from exc
         if not math.isfinite(frequency):
             raise ConfigurationError("commands keys must be finite stimulus frequencies")
-        if not isinstance(command, str) or not command:
-            raise ConfigurationError("commands values must be non-empty strings")
+        try:
+            command = ControlCommand.parse(command)
+        except ValueError as exc:
+            raise ConfigurationError(f"commands values must be known control commands: {exc}") from exc
+        if command is ControlCommand.UNKNOWN:
+            raise ConfigurationError("commands values must not be UNKNOWN")
         if frequency in commands:
             raise ConfigurationError("commands must not contain duplicate frequency mappings")
         commands[frequency] = command
@@ -231,6 +238,25 @@ def load_config(path: str | Path) -> DemoConfig:
         cjk_font_file=_optional_string(_optional(ui_data, "cjk_font_file", None), "ui.cjk_font_file"),
         cjk_font_name=_optional_string(_optional(ui_data, "cjk_font_name", None), "ui.cjk_font_name"),
     )
+    try:
+        control = ControlConfig(
+            confidence_threshold=_number(
+                _optional(control_data, "confidence_threshold", 0.60), "control.confidence_threshold"
+            ),
+            confirmations_required=_optional(control_data, "confirmations_required", 2),
+            max_confirmation_gap_s=_number(
+                _optional(control_data, "max_confirmation_gap_s", 1.0), "control.max_confirmation_gap_s"
+            ),
+            command_duration_s=_number(
+                _optional(control_data, "command_duration_s", 0.5), "control.command_duration_s"
+            ),
+            input_timeout_s=_number(_optional(control_data, "input_timeout_s", 1.0), "control.input_timeout_s"),
+            max_prediction_age_s=_number(
+                _optional(control_data, "max_prediction_age_s", 0.5), "control.max_prediction_age_s"
+            ),
+        )
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
 
     return DemoConfig(
         stimulus=StimulusConfig(
@@ -253,4 +279,5 @@ def load_config(path: str | Path) -> DemoConfig:
         decoder=DecoderConfig(decoder_type, harmonics, bandpass_hz),
         commands=commands,
         ui=ui,
+        control=control,
     )
