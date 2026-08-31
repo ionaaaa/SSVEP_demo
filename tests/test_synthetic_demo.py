@@ -18,6 +18,7 @@ from ssvep_demo.synthetic_demo import (
     SyntheticDemoStateMachine,
     SyntheticTrialCoordinator,
 )
+from ssvep_demo.session_logging import resolved_config_dict
 from ssvep_demo.virtual_car import VirtualCarController
 
 
@@ -216,7 +217,7 @@ def test_same_seed_reproduces_window_and_prediction() -> None:
 
 
 def test_unified_synthetic_session_log_contains_required_trial_fields(tmp_path: Path) -> None:
-    logger = SyntheticDemoSessionLogger(tmp_path, CONFIG_PATH, {"mode": "synthetic", "real_eeg_validated": False})
+    logger = SyntheticDemoSessionLogger(tmp_path, resolved_config_dict(CONFIG), {"mode": "synthetic", "real_eeg_validated": False})
     logger.trial(
         {
             "trial_id": 0,
@@ -224,7 +225,7 @@ def test_unified_synthetic_session_log_contains_required_trial_fields(tmp_path: 
             "trial_status": "completed",
             "target_frequency_hz": 8.0,
             "target_command": "LEFT",
-            "decoder_scores": json.dumps({"8.0": 1.0}),
+            "decoder_scores_json": json.dumps({"8.0": 1.0}),
             "predicted_frequency_hz": 8.0,
             "predicted_command": "LEFT",
             "confidence": 0.9,
@@ -232,11 +233,11 @@ def test_unified_synthetic_session_log_contains_required_trial_fields(tmp_path: 
             "car_end_x": 0.1,
         }
     )
-    logger.close()
+    logger.close(status="finished", archived_eeg_windows=0, final_car_state=None)
     with (logger.directory / "trials.csv").open(newline="", encoding="utf-8") as file:
         row = next(csv.DictReader(file))
-    metadata = json.loads((logger.directory / "session.json").read_text(encoding="utf-8"))
-    assert row["decoder_scores"] == '{"8.0": 1.0}'
+    metadata = json.loads((logger.directory / "summary.json").read_text(encoding="utf-8"))
+    assert row["decoder_scores_json"] == '{"8.0": 1.0}'
     assert {"target_frequency_hz", "predicted_command", "car_end_heading", "dropped_frame_count"}.issubset(row)
     assert metadata["mode"] == "synthetic"
 

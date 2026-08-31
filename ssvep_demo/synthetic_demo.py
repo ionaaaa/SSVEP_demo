@@ -7,14 +7,12 @@ or real-car implementation.  PsychoPy is imported only from ``run``.
 
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 import json
 import math
 from pathlib import Path
-import shutil
 import time
 from typing import Any, Callable, Protocol, Sequence
 
@@ -39,6 +37,8 @@ from .stimulus import (
 )
 from .synthetic import SyntheticEEGSource
 from .virtual_car import VirtualCarController
+from .eeg_archive import EEGWindowArchiveWriter
+from .session_logging import UnifiedSessionLogger, resolved_config_dict
 
 
 class SyntheticDemoState(str, Enum):
@@ -193,52 +193,9 @@ class SyntheticTrialCoordinator:
         )
 
 
-class SyntheticDemoSessionLogger:
-    """One flushed, unified session directory for stimulus, decoder, and car."""
-
-    fields = [
-        "trial_id", "mode", "trial_status", "target_frequency_hz", "target_command",
-        "stimulus_start_monotonic_s", "stimulus_end_monotonic_s", "synthetic_seed", "snr_db",
-        "decoder_type", "decoder_scores", "predicted_frequency_hz", "predicted_command", "confidence",
-        "dispatcher_action", "dispatcher_reason", "effective_command", "confirmations_required",
-        "generation_latency_ms", "decoding_latency_ms", "execution_start_monotonic_s",
-        "execution_end_monotonic_s", "car_start_x", "car_start_y", "car_start_heading",
-        "car_end_x", "car_end_y", "car_end_heading", "correct", "dropped_frame_count",
-    ]
-
-    def __init__(self, output_root: Path, config_path: Path, metadata: dict[str, Any]) -> None:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        self.directory = output_root / f"session_{stamp}"
-        suffix = 1
-        while self.directory.exists():
-            self.directory = output_root / f"session_{stamp}_{suffix:02d}"
-            suffix += 1
-        self.directory.mkdir(parents=True)
-        shutil.copy2(config_path, self.directory / "config.yaml")
-        self.metadata = metadata
-        self._write_metadata()
-        self._events = (self.directory / "events.jsonl").open("a", encoding="utf-8")
-        self._trials_file = (self.directory / "trials.csv").open("w", encoding="utf-8", newline="")
-        self._trials = csv.DictWriter(self._trials_file, fieldnames=self.fields)
-        self._trials.writeheader()
-        self._trials_file.flush()
-
-    def _write_metadata(self) -> None:
-        (self.directory / "session.json").write_text(json.dumps(self.metadata, indent=2), encoding="utf-8")
-
-    def event(self, event_type: str, **payload: Any) -> None:
-        self._events.write(json.dumps({"event": event_type, "monotonic_s": time.monotonic(), **payload}) + "\n")
-        self._events.flush()
-
-    def trial(self, record: dict[str, Any]) -> None:
-        self._trials.writerow({field: record.get(field) for field in self.fields})
-        self._trials_file.flush()
-
-    def close(self, **summary: Any) -> None:
-        self.metadata.update(summary)
-        self._write_metadata()
-        self._events.close()
-        self._trials_file.close()
+# Backwards-compatible import name; new synthetic and replay paths both use
+# UnifiedSessionLogger rather than independent file layouts.
+SyntheticDemoSessionLogger = UnifiedSessionLogger
 
 
 class _SyntheticDemoView:
@@ -362,6 +319,7 @@ class SSVEPSyntheticDemoRunner:
         self.schedule = schedule if max_trials is None else schedule[:max_trials]
         self.state_machine = SyntheticDemoStateMachine(self.schedule)
         self._drop_total = 0
+        self._attempts: dict[int, int] = {}
 
     def _make_decoder(self) -> SSVEPDecoder:
         return FFTDecoder(self.config) if self.decoder_type == "fft" else CCADecoder(self.config)
@@ -382,9 +340,11 @@ class SSVEPSyntheticDemoRunner:
             units="norm",
             waitBlanking=True,
         )
-        logger: SyntheticDemoSessionLogger | None = None
+        logger: UnifiedSessionLogger | None = None
+        archive: EEGWindowArchiveWriter | None = None
         dispatcher: SafeCommandDispatcher | None = None
         car = VirtualCarController()
+        error: BaseException | None = None
         try:
             font = resolve_cjk_font(
                 None,
@@ -401,11 +361,19 @@ class SSVEPSyntheticDemoRunner:
             planned_frames = max(1, round(self.config.stimulus.trial_duration_s * refresh_hz))
             sequences = planned_flicker_sequences(self.config.stimulus.frequencies_hz, refresh_hz, planned_frames)
             estimates = {frequency: estimate_effective_frequency_hz(sequence, refresh_hz) for frequency, sequence in sequences.items()}
-            logger = SyntheticDemoSessionLogger(
+            effective_config = resolved_config_dict(
+                self.config,
+                decoder_type=self.decoder_type,
+                synthetic_snr_db=self.snr_db,
+                synthetic_seed=self.seed,
+                confirmations_required=self.control_config.confirmations_required,
+            )
+            effective_config["stimulus"]["fullscreen"] = self.fullscreen
+            effective_config["runtime"] = {"refresh_rate_hz": self.refresh_rate_override_hz}
+            logger = UnifiedSessionLogger(
                 self.output_dir,
-                self.config_path,
+                effective_config,
                 {
-                    "created_utc": datetime.now(timezone.utc).isoformat(),
                     "mode": "synthetic",
                     "synthetic_source_uses_trial_target": True,
                     "real_eeg_validated": False,
@@ -422,6 +390,11 @@ class SSVEPSyntheticDemoRunner:
                     "effective_frequency_estimation": "off_to_on_rising_edges / planned_duration",
                 },
             )
+            archive = EEGWindowArchiveWriter(
+                logger.directory / "eeg_windows.npz",
+                self.config.acquisition.channels,
+                int(round(self.config.stimulus.trial_duration_s * self.config.acquisition.sample_rate_hz)),
+            )
             print("SIMULATION MODE: EEG is synthesized from each trial target; this is not real human SSVEP.")
             print("No real EEG or real car has been validated.")
             print(f"PsychoPy {psychopy.__version__}; refresh {refresh_hz:.4f} Hz ({refresh_source})")
@@ -432,8 +405,16 @@ class SSVEPSyntheticDemoRunner:
                 self.config, self._make_decoder(), dispatcher, snr_db=self.snr_db, seed=self.seed
             )
             view = _SyntheticDemoView(win, visual, self.config, font, estimates)
-            self._run_loop(win, visual, event, view, logger, coordinator, dispatcher, car, refresh_hz, nominal_interval_s)
+            self._run_loop(
+                win, visual, event, view, logger, archive, coordinator, dispatcher, car, refresh_hz, nominal_interval_s
+            )
+            logger.event("session_finished" if self.state_machine.state is SyntheticDemoState.FINISHED else "session_stopped")
             return logger.directory
+        except BaseException as exc:
+            error = exc
+            if logger is not None:
+                logger.event("session_failed", error_type=type(exc).__name__, error_message=str(exc)[:500])
+            raise
         finally:
             try:
                 if dispatcher is not None:
@@ -441,8 +422,112 @@ class SSVEPSyntheticDemoRunner:
             finally:
                 car.stop()
                 if logger is not None:
-                    logger.close(final_state=self.state_machine.state.value, session_dropped_frame_count=self._drop_total)
+                    logger.close(
+                        status=("failed" if error else self.state_machine.state.value.lower()),
+                        archived_eeg_windows=archive.count if archive is not None else 0,
+                        final_car_state=car.state(),
+                        error=error,
+                    )
                 win.close()
+
+    def run_offline(self) -> Path:
+        """Generate/decode/archive a deterministic synthetic session without PsychoPy.
+
+        This is intentionally an acceptance/batch path: it does not claim to
+        present a visual stimulus or create display-aligned markers.
+        """
+        effective_config = resolved_config_dict(
+            self.config,
+            decoder_type=self.decoder_type,
+            synthetic_snr_db=self.snr_db,
+            synthetic_seed=self.seed,
+            confirmations_required=self.control_config.confirmations_required,
+        )
+        effective_config["runtime"] = {"no_gui": True}
+        logger = UnifiedSessionLogger(
+            self.output_dir,
+            effective_config,
+            {
+                "mode": "synthetic",
+                "synthetic_source_uses_trial_target": True,
+                "real_eeg_validated": False,
+                "real_car_validated": False,
+                "decoder_type": self.decoder_type,
+                "snr_db": self.snr_db,
+                "synthetic_seed": self.seed,
+                "confirmations_required": self.control_config.confirmations_required,
+            },
+        )
+        archive = EEGWindowArchiveWriter(
+            logger.directory / "eeg_windows.npz",
+            self.config.acquisition.channels,
+            int(round(self.config.stimulus.trial_duration_s * self.config.acquisition.sample_rate_hz)),
+        )
+        car = VirtualCarController()
+        dispatcher = SafeCommandDispatcher(car, self.control_config, self.config.commands)
+        coordinator = SyntheticTrialCoordinator(self.config, self._make_decoder(), dispatcher, snr_db=self.snr_db, seed=self.seed)
+        error: BaseException | None = None
+        try:
+            logger.event("session_started")
+            for trial in self.schedule:
+                attempt_id = self._next_attempt_id(trial.trial_id)
+                logger.event("cue_started", trial_id=trial.trial_id, attempt_id=attempt_id)
+                logger.event("decode_started", trial_id=trial.trial_id, attempt_id=attempt_id)
+                car_start = car.state()
+                computation = coordinator.process(trial)
+                result, decision = computation.result, computation.decision
+                window_index = archive.add(
+                    computation.window, trial_id=trial.trial_id, attempt_id=attempt_id,
+                    target_frequency_hz=trial.target_frequency_hz, source_mode="synthetic",
+                )
+                execution_start_s = decision.timestamp_s if decision.action == "executed" else None
+                execution_end_s = None
+                if decision.action == "executed" and dispatcher.motion_deadline_s is not None:
+                    deadline = dispatcher.motion_deadline_s
+                    car.update(max(0.0, deadline - decision.timestamp_s))
+                    stopped = dispatcher.tick(deadline)
+                    execution_end_s = stopped.timestamp_s if stopped else deadline
+                car.stop()
+                logger.trial(
+                    {
+                        "trial_id": trial.trial_id, "attempt_id": attempt_id, "mode": "synthetic",
+                        "trial_status": "completed", "target_frequency_hz": trial.target_frequency_hz,
+                        "target_command": trial.command, "synthetic_seed": computation.synthetic_seed, "snr_db": self.snr_db,
+                        "decoder_type": self.decoder_type,
+                        "decoder_scores_json": json.dumps({str(key): value for key, value in result.scores.items()}),
+                        "predicted_frequency_hz": result.predicted_frequency_hz,
+                        "predicted_command": getattr(result.command, "value", result.command),
+                        "effective_command": decision.effective_command.value, "confidence": result.confidence,
+                        "correct": result.predicted_frequency_hz == trial.target_frequency_hz,
+                        "decoder_latency_ms": computation.decoding_latency_ms,
+                        "decoding_latency_ms": computation.decoding_latency_ms,
+                        "generation_latency_ms": computation.generation_latency_ms,
+                        "dropped_frames": 0, "dropped_frame_count": 0, "eeg_window_index": window_index,
+                        "dispatcher_action": decision.action, "dispatcher_reason": decision.reason,
+                        "confirmations_required": self.control_config.confirmations_required,
+                        "execution_start_monotonic_s": execution_start_s, "execution_end_monotonic_s": execution_end_s,
+                        "car_start_x": car_start["x"], "car_start_y": car_start["y"],
+                        "car_start_heading": car_start["heading_degrees"],
+                        "car_end_x": car.x, "car_end_y": car.y, "car_end_heading": car.heading_degrees,
+                    }
+                )
+                logger.event("synthetic_eeg_generated", trial_id=trial.trial_id, attempt_id=attempt_id, eeg_window_index=window_index)
+                logger.event("decode_completed", trial_id=trial.trial_id, attempt_id=attempt_id, prediction=result.predicted_frequency_hz)
+                logger.event("command_dispatched", trial_id=trial.trial_id, attempt_id=attempt_id, action=decision.action, reason=decision.reason)
+                logger.event("trial_completed", trial_id=trial.trial_id, attempt_id=attempt_id)
+            logger.event("session_finished")
+            return logger.directory
+        except BaseException as exc:
+            error = exc
+            logger.event("session_failed", error_type=type(exc).__name__, error_message=str(exc)[:500])
+            raise
+        finally:
+            dispatcher.close()
+            car.stop()
+            logger.close(
+                status="failed" if error else "finished", archived_eeg_windows=archive.count,
+                final_car_state=car.state(), error=error,
+            )
 
     def _run_loop(
         self,
@@ -450,7 +535,8 @@ class SSVEPSyntheticDemoRunner:
         visual: Any,
         event: Any,
         view: _SyntheticDemoView,
-        logger: SyntheticDemoSessionLogger,
+        logger: UnifiedSessionLogger,
+        archive: EEGWindowArchiveWriter,
         coordinator: SyntheticTrialCoordinator,
         dispatcher: SafeCommandDispatcher,
         car: VirtualCarController,
@@ -473,15 +559,19 @@ class SSVEPSyntheticDemoRunner:
             frame_start_s = previous_frame_s
             delta_time_s = max(0.0, now_s - frame_start_s)
             previous_frame_s = now_s
+            active_trial = (
+                self.state_machine.current_trial if self.state_machine.state is not SyntheticDemoState.IDLE else None
+            )
             keys = event.getKeys(keyList=["return", "p", "escape"])
             if "escape" in keys:
+                active_attempt_id = record.get("attempt_id") if record else None
                 dispatcher.stop(now_s, reason="escape")
                 if record is not None:
                     self._finish_record(record, car, "stopped")
                     logger.trial(record)
                     record = None
                 self.state_machine.stop()
-                logger.event("session_stopped", reason="escape")
+                logger.event("session_stopped", trial_id=active_trial.trial_id if active_trial else None, attempt_id=active_attempt_id, reason="escape")
                 continue
             if "p" in keys:
                 if self.state_machine.state is SyntheticDemoState.PAUSED:
@@ -490,7 +580,7 @@ class SSVEPSyntheticDemoRunner:
                     marker = None
                     computation = None
                     record = None
-                    logger.event("resumed", trial_id=self.state_machine.current_trial.trial_id)
+                    logger.event("resumed", trial_id=self.state_machine.current_trial.trial_id, attempt_id=None)
                 elif self.state_machine.state not in {SyntheticDemoState.IDLE, SyntheticDemoState.FINISHED, SyntheticDemoState.STOPPED}:
                     if self.state_machine.state is not SyntheticDemoState.REST and record is not None:
                         self._finish_record(record, car, "aborted")
@@ -498,7 +588,7 @@ class SSVEPSyntheticDemoRunner:
                     dispatcher.stop(now_s, reason="paused")
                     was_rest = self.state_machine.state is SyntheticDemoState.REST
                     self.state_machine.pause()
-                    logger.event("paused", trial_id=self.state_machine.current_trial.trial_id)
+                    logger.event("trial_aborted" if not was_rest else "paused", trial_id=self.state_machine.current_trial.trial_id, attempt_id=record.get("attempt_id") if record else None)
                     if not was_rest:
                         record = None
                 continue
@@ -531,7 +621,8 @@ class SSVEPSyntheticDemoRunner:
                 if cue_start_s is None:
                     cue_start_s = now_s
                     record = self._new_record(trial)
-                    logger.event("cue_started", trial_id=trial.trial_id)
+                    record["cue_start_monotonic_s"] = cue_start_s
+                    logger.event("cue_started", trial_id=trial.trial_id, attempt_id=record["attempt_id"])
                 view.draw(
                     state=state, trial=trial, target_states=static_target_states(self.config.stimulus.frequencies_hz), car=car,
                     result=None, decision=None, trial_total=len(self.schedule), dropped_frame_count=self._drop_total, remaining_s=None,
@@ -548,7 +639,7 @@ class SSVEPSyntheticDemoRunner:
                     marker = FlipMarkerRecorder()
                     scheduler = FlickerScheduler(self.config.stimulus.frequencies_hz, refresh_hz)
                     interval_start = len(win.frameIntervals)
-                    logger.event("stimulation_started", trial_id=trial.trial_id)
+                    logger.event("stimulation_started", trial_id=trial.trial_id, attempt_id=record["attempt_id"])
                 assert marker is not None and scheduler is not None
                 view.draw(
                     state=state, trial=trial, target_states=scheduler.advance(), car=car, result=None, decision=None,
@@ -575,18 +666,28 @@ class SSVEPSyntheticDemoRunner:
                     trial_marker = marker.marker(trial)
                     record["stimulus_start_monotonic_s"] = trial_marker.stimulus_start_monotonic_s
                     record["stimulus_end_monotonic_s"] = trial_marker.stimulus_end_monotonic_s
-                    record["dropped_frame_count"] = len(dropped)
+                    record["dropped_frame_count"] = record["dropped_frames"] = len(dropped)
+                    logger.frame_intervals(trial.trial_id, record["attempt_id"], intervals, dropped)
+                    logger.event("stimulation_completed", trial_id=trial.trial_id, attempt_id=record["attempt_id"])
                 continue
             if state is SyntheticDemoState.DECODING:
                 assert record is not None
                 car_snapshot = car.state()
+                logger.event("decode_started", trial_id=trial.trial_id, attempt_id=record["attempt_id"])
                 computation = coordinator.process(trial)
                 result, decision = computation.result, computation.decision
+                record["eeg_window_index"] = archive.add(
+                    computation.window,
+                    trial_id=trial.trial_id,
+                    attempt_id=record["attempt_id"],
+                    target_frequency_hz=trial.target_frequency_hz,
+                    source_mode="synthetic",
+                )
                 record.update(
                     synthetic_seed=computation.synthetic_seed,
                     snr_db=self.snr_db,
                     decoder_type=self.decoder_type,
-                    decoder_scores=json.dumps({str(key): value for key, value in result.scores.items()}),
+                    decoder_scores_json=json.dumps({str(key): value for key, value in result.scores.items()}),
                     predicted_frequency_hz=result.predicted_frequency_hz,
                     predicted_command=getattr(result.command, "value", result.command),
                     confidence=result.confidence,
@@ -596,6 +697,7 @@ class SSVEPSyntheticDemoRunner:
                     confirmations_required=self.control_config.confirmations_required,
                     generation_latency_ms=computation.generation_latency_ms,
                     decoding_latency_ms=computation.decoding_latency_ms,
+                    decoder_latency_ms=computation.decoding_latency_ms,
                     car_start_x=car_snapshot["x"], car_start_y=car_snapshot["y"],
                     car_start_heading=car_snapshot["heading_degrees"],
                     correct=result.predicted_frequency_hz == trial.target_frequency_hz,
@@ -606,7 +708,9 @@ class SSVEPSyntheticDemoRunner:
                     record["execution_start_monotonic_s"] = decision.timestamp_s
                 else:
                     record["execution_end_monotonic_s"] = decision.timestamp_s
-                logger.event("decoded", trial_id=trial.trial_id, prediction=result.predicted_frequency_hz, action=decision.action)
+                logger.event("synthetic_eeg_generated", trial_id=trial.trial_id, attempt_id=record["attempt_id"], eeg_window_index=record["eeg_window_index"])
+                logger.event("decode_completed", trial_id=trial.trial_id, attempt_id=record["attempt_id"], prediction=result.predicted_frequency_hz)
+                logger.event("command_dispatched", trial_id=trial.trial_id, attempt_id=record["attempt_id"], action=decision.action, reason=decision.reason)
                 continue
             if state is SyntheticDemoState.EXECUTING:
                 assert computation is not None and record is not None
@@ -628,6 +732,7 @@ class SSVEPSyntheticDemoRunner:
                     record["dispatcher_reason"] = decision.reason
                     record["effective_command"] = decision.effective_command.value
                     record["execution_end_monotonic_s"] = decision.timestamp_s
+                    logger.event("car_stopped", trial_id=trial.trial_id, attempt_id=record["attempt_id"], reason=decision.reason)
                 remaining_s = None if deadline is None else max(0.0, deadline - now_s)
                 view.draw(
                     state=state, trial=trial, target_states=static_target_states(self.config.stimulus.frequencies_hz), car=car,
@@ -646,7 +751,7 @@ class SSVEPSyntheticDemoRunner:
                 car.stop()
                 if rest_start_s is None:
                     rest_start_s = now_s
-                    logger.event("rest_started", trial_id=trial.trial_id)
+                    logger.event("rest_started", trial_id=trial.trial_id, attempt_id=record["attempt_id"])
                 assert record is not None
                 result = computation.result if computation else None
                 decision = computation.decision if computation else None
@@ -658,6 +763,7 @@ class SSVEPSyntheticDemoRunner:
                 if now_s - rest_start_s >= self.config.stimulus.rest_duration_s:
                     self._finish_record(record, car, "completed")
                     logger.trial(record)
+                    logger.event("trial_completed", trial_id=trial.trial_id, attempt_id=record["attempt_id"])
                     self.state_machine.rest_complete()
                     cue_start_s = rest_start_s = stimulation_started_s = None
                     marker = scheduler = computation = record = None
@@ -665,6 +771,7 @@ class SSVEPSyntheticDemoRunner:
     def _new_record(self, trial: ScheduledTrial) -> dict[str, Any]:
         return {
             "trial_id": trial.trial_id,
+            "attempt_id": self._next_attempt_id(trial.trial_id),
             "mode": "synthetic",
             "trial_status": "running",
             "target_frequency_hz": trial.target_frequency_hz,
@@ -672,6 +779,11 @@ class SSVEPSyntheticDemoRunner:
             "confirmations_required": self.control_config.confirmations_required,
             "snr_db": self.snr_db,
         }
+
+    def _next_attempt_id(self, trial_id: int) -> int:
+        attempt_id = self._attempts.get(trial_id, 0)
+        self._attempts[trial_id] = attempt_id + 1
+        return attempt_id
 
     @staticmethod
     def _finish_record(record: dict[str, Any], car: VirtualCarController, status: str) -> None:

@@ -7,6 +7,8 @@ from .protocol import CANONICAL_CHANNELS, DecodeResult, EEGWindow, TrialMarker
 from .synthetic import SyntheticEEGSource
 from .stimulus import FlickerScheduler, PsychoPyStimulusRunner, TrialState, TrialStateMachine
 from .synthetic_demo import SSVEPSyntheticDemoRunner, SyntheticDemoState, SyntheticDemoStateMachine
+from .eeg_archive import EEGWindowArchiveWriter, ReplayEEGSource
+from .replay import ReplayDemoRunner
 from .virtual_car import VirtualCarController
 
 __all__ = [
@@ -19,11 +21,14 @@ __all__ = [
     "DispatchDecision",
     "DemoConfig",
     "EEGWindow",
+    "EEGWindowArchiveWriter",
     "FFTDecoder",
     "FlickerScheduler",
     "PsychoPyStimulusRunner",
     "SSVEPDecoder",
     "SafeCommandDispatcher",
+    "ReplayDemoRunner",
+    "ReplayEEGSource",
     "SyntheticEEGSource",
     "SyntheticDemoConfig",
     "SyntheticDemoState",
