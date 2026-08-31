@@ -95,6 +95,34 @@ def _validate_font_file(path: Path, font_name: str) -> None:
             raise ValueError(f"Bundled CJK font failed integrity validation: {path}. {guidance}")
 
 
+def register_cjk_font(win: Any, visual: Any, font: CJKFontSpec) -> None:
+    """Register an external font once, before persistent text is created."""
+    try:
+        visual.TextStim(win, text="", font=font.name, fontFiles=[str(font.file)], autoLog=False)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Unable to load CJK font file '{font.file}' as '{font.name}'. "
+            "Use ui.cjk_font_file/ui.cjk_font_name or --cjk-font-file/--cjk-font-name to provide a valid font."
+        ) from exc
+
+
+def measure_refresh_rate(win: Any, refresh_rate_override_hz: float | None) -> tuple[float, str]:
+    """Warm a PsychoPy window then measure its refresh rate or use an explicit override."""
+    for _ in range(30):
+        win.flip()
+    if refresh_rate_override_hz is not None:
+        if not math.isfinite(refresh_rate_override_hz) or refresh_rate_override_hz <= 0:
+            raise ValueError("--refresh-rate must be a positive finite value")
+        return float(refresh_rate_override_hz), "cli_override"
+    try:
+        rate = win.getActualFrameRate(nIdentical=60, nMaxFrames=240, nWarmUpFrames=30)
+    except Exception as exc:
+        raise RuntimeError("PsychoPy refresh-rate measurement failed; pass --refresh-rate to override it.") from exc
+    if rate is None or not math.isfinite(rate) or rate <= 0:
+        raise RuntimeError("PsychoPy could not measure refresh rate; pass --refresh-rate to override it.")
+    return float(rate), "measured"
+
+
 class TrialState(str, Enum):
     IDLE = "IDLE"
     CUE = "CUE"
@@ -131,7 +159,10 @@ def build_trial_schedule(
         raise ValueError("every target frequency must have a command mapping")
     if trial_order == "random":
         random.Random(random_seed).shuffle(targets)
-    return [ScheduledTrial(index, frequency, commands[frequency]) for index, frequency in enumerate(targets)]
+    return [
+        ScheduledTrial(index, frequency, getattr(commands[frequency], "value", commands[frequency]))
+        for index, frequency in enumerate(targets)
+    ]
 
 
 class TrialStateMachine:
@@ -532,33 +563,11 @@ class PsychoPyStimulusRunner:
         return None
 
     def _measure_refresh_rate(self, win: Any) -> tuple[float, str]:
-        # Pre-warm blank flips so window creation frames do not bias measurement.
-        for _ in range(30):
-            win.flip()
-        if self.refresh_rate_override_hz is not None:
-            if not math.isfinite(self.refresh_rate_override_hz) or self.refresh_rate_override_hz <= 0:
-                raise ValueError("--refresh-rate must be a positive finite value")
-            return float(self.refresh_rate_override_hz), "cli_override"
-        try:
-            rate = win.getActualFrameRate(nIdentical=60, nMaxFrames=240, nWarmUpFrames=30)
-        except Exception as exc:
-            raise RuntimeError("PsychoPy refresh-rate measurement failed; pass --refresh-rate to override it.") from exc
-        if rate is None or not math.isfinite(rate) or rate <= 0:
-            raise RuntimeError("PsychoPy could not measure refresh rate; pass --refresh-rate to override it.")
-        return float(rate), "measured"
+        return measure_refresh_rate(win, self.refresh_rate_override_hz)
 
     @staticmethod
     def _register_cjk_font(win: Any, visual: Any, font: CJKFontSpec) -> None:
-        """Register an external font once, before any persistent text is made."""
-        try:
-            # TextStim's fontFiles loader registers the file with PsychoPy's
-            # backend. All later stimuli receive only the registered name.
-            visual.TextStim(win, text="", font=font.name, fontFiles=[str(font.file)], autoLog=False)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Unable to load CJK font file '{font.file}' as '{font.name}'. "
-                "Use ui.cjk_font_file/ui.cjk_font_name or --cjk-font-file/--cjk-font-name to provide a valid font."
-            ) from exc
+        register_cjk_font(win, visual, font)
 
     def _run_loop(
         self, win: Any, visual: Any, event: Any, logger: _SessionLogger, refresh_hz: float,

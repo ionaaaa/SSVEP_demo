@@ -22,18 +22,20 @@ def test_load_demo_config() -> None:
     assert config.stimulus.frequencies_hz == (8.0, 10.0, 12.0, 15.0)
     assert config.acquisition.channels == CANONICAL_CHANNELS
     assert config.decoder.type == "cca"
-    assert config.commands == {8.0: "LEFT", 10.0: "RIGHT", 12.0: "FORWARD", 15.0: "STOP"}
+    assert config.commands == {8.0: "LEFT", 10.0: "RIGHT", 12.0: "FORWARD", 15.0: "BACKWARD"}
     assert config.stimulus.cue_duration_s == 1.0
     assert config.stimulus.window_size == (1200, 800)
     assert config.ui.cjk_font_file is None
     assert config.commands[8.0] is ControlCommand.LEFT
     assert config.control.confirmations_required == 2
+    assert config.synthetic_demo.confirmations_required == 1
 
 
 def test_old_config_without_visual_fields_uses_stimulus_defaults(tmp_path: Path) -> None:
     config = _base_config()
     config.pop("ui")
     config.pop("control")
+    config.pop("synthetic_demo")
     for field in (
         "cue_duration_s", "trial_order", "random_seed", "fullscreen", "window_size", "screen_index",
         "background_color", "stimulus_on_color", "stimulus_off_color", "dropped_frame_threshold_ratio",
@@ -47,6 +49,7 @@ def test_old_config_without_visual_fields_uses_stimulus_defaults(tmp_path: Path)
     assert loaded.stimulus.dropped_frame_threshold_ratio == 1.5
     assert loaded.ui.cjk_font_file is None
     assert loaded.control.command_duration_s == 0.5
+    assert loaded.synthetic_demo.seed == 42
 
 
 def test_load_config_accepts_optional_cjk_font_override(tmp_path: Path) -> None:
@@ -70,7 +73,8 @@ def test_load_config_accepts_optional_cjk_font_override(tmp_path: Path) -> None:
         (lambda config: config["decoder"].update(type="trca"), "must be either"),
         (lambda config: config["decoder"].update(bandpass_hz=[6, 125]), "Nyquist"),
         (lambda config: config.update(commands={"8": "LEFT"}), "every and only"),
-        (lambda config: config["commands"].update({"8": "BACKWARD"}), "known control commands"),
+        (lambda config: config["commands"].update({"8": "WARP"}), "known control commands"),
+        (lambda config: config["commands"].update({"15": "STOP"}), "must not map"),
         (lambda config: config["control"].update(confirmations_required=0), "positive integer"),
         (lambda config: config["stimulus"].update(trial_order="shuffle"), "trial_order"),
         (lambda config: config["stimulus"].update(window_size=[0, 800]), "window_size"),

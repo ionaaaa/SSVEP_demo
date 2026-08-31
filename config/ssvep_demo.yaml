@@ -29,7 +29,7 @@ commands:
   "8": LEFT
   "10": RIGHT
   "12": FORWARD
-  "15": STOP
+  "15": BACKWARD
 
 control:
   confidence_threshold: 0.60
@@ -38,6 +38,11 @@ control:
   command_duration_s: 0.5
   input_timeout_s: 1.0
   max_prediction_age_s: 0.5
+
+synthetic_demo:
+  snr_db: 0.0
+  seed: 42
+  confirmations_required: 1
 
 ui:
   # Null selects the bundled Noto Sans CJK SC font. A relative override path

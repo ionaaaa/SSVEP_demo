@@ -23,6 +23,7 @@ class ControlCommand(str, Enum):
     LEFT = "LEFT"
     RIGHT = "RIGHT"
     FORWARD = "FORWARD"
+    BACKWARD = "BACKWARD"
     STOP = "STOP"
     UNKNOWN = "UNKNOWN"
 
@@ -229,6 +230,23 @@ class SafeCommandDispatcher:
             return
         self._closed = True
         self._stop_and_clear()
+
+    def stop(self, now_s: float | None = None, *, reason: str = "lifecycle_stop") -> DispatchDecision:
+        """Stop and clear pending confirmation without permanently closing.
+
+        GUI pause, window-close, and other lifecycle boundaries use this rather
+        than synthesising a decoder prediction.  It is safe to invoke repeatedly.
+        """
+        timestamp_s = self._now() if now_s is None else self._validate_now(now_s)
+        self._stop_and_clear()
+        return self._decision(
+            ControlCommand.UNKNOWN, ControlCommand.STOP, "stopped", reason, timestamp_s
+        )
+
+    @property
+    def motion_deadline_s(self) -> float | None:
+        """Absolute monotonic stop deadline, exposed for frame-rate-safe views."""
+        return self._motion_deadline_s
 
     def _confirm_or_execute(
         self, command: ControlCommand, prediction_timestamp_s: float, now_s: float

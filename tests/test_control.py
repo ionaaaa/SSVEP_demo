@@ -10,7 +10,7 @@ COMMANDS = {
     8.0: ControlCommand.LEFT,
     10.0: ControlCommand.RIGHT,
     12.0: ControlCommand.FORWARD,
-    15.0: ControlCommand.STOP,
+    15.0: ControlCommand.BACKWARD,
 }
 
 
@@ -111,7 +111,7 @@ def test_stop_is_immediate_and_clears_pending_and_active_motion() -> None:
     assert dispatcher.submit(_result(ControlCommand.LEFT, 0.02)).action == "pending"
     assert controller.is_moving
     clock.now_s = 0.1
-    stopped = dispatcher.submit(_result(ControlCommand.STOP, 0.1, confidence=0.0))
+    stopped = dispatcher.submit(DecodeResult(15.0, ControlCommand.STOP, {15.0: 1.0}, 0.0, 0.1))
     assert (stopped.action, stopped.reason, stopped.confirmation_count) == ("stopped", "stop_priority", 0)
     assert not controller.is_moving
     assert controller.stop_calls >= 1
@@ -177,4 +177,4 @@ def test_close_and_controller_failures_are_safe_and_idempotent() -> None:
 def test_command_parser_rejects_unknown_configuration_values() -> None:
     assert ControlCommand.parse(" left ") is ControlCommand.LEFT
     with pytest.raises(ValueError, match="unknown control command"):
-        ControlCommand.parse("BACKWARD")
+        ControlCommand.parse("WARP")

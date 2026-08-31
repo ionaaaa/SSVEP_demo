@@ -28,21 +28,21 @@ class VirtualCarController:
     is_moving: bool = False
     active_command: ControlCommand | None = None
     bounds: tuple[float, float, float, float] = (-0.85, 0.85, -0.70, 0.70)
-    turn_degrees: float = 20.0
-    forward_step: float = 0.12
+    turn_rate_degrees_s: float = 90.0
+    speed_units_s: float = 0.30
 
     def __post_init__(self) -> None:
         if len(self.bounds) != 4 or self.bounds[0] >= self.bounds[1] or self.bounds[2] >= self.bounds[3]:
             raise ValueError("bounds must be (min_x, max_x, min_y, max_y) with increasing limits")
-        if not math.isfinite(self.turn_degrees) or self.turn_degrees <= 0:
-            raise ValueError("turn_degrees must be a positive finite number")
-        if not math.isfinite(self.forward_step) or self.forward_step <= 0:
-            raise ValueError("forward_step must be a positive finite number")
+        if not math.isfinite(self.turn_rate_degrees_s) or self.turn_rate_degrees_s <= 0:
+            raise ValueError("turn_rate_degrees_s must be a positive finite number")
+        if not math.isfinite(self.speed_units_s) or self.speed_units_s <= 0:
+            raise ValueError("speed_units_s must be a positive finite number")
         self.heading_degrees = float(self.heading_degrees) % 360.0
         self.x, self.y = self._clamped_position(self.x, self.y)
 
     def execute(self, command: ControlCommand) -> None:
-        """Apply one simple movement update; UNKNOWN is never accepted."""
+        """Set a movement command; position changes only in :meth:`update`."""
         if not isinstance(command, ControlCommand):
             raise ValueError("VirtualCarController.execute requires a ControlCommand")
         if command is ControlCommand.UNKNOWN:
@@ -50,20 +50,31 @@ class VirtualCarController:
         if command is ControlCommand.STOP:
             self.stop()
             return
-        if command is ControlCommand.LEFT:
-            self.heading_degrees = (self.heading_degrees + self.turn_degrees) % 360.0
-        elif command is ControlCommand.RIGHT:
-            self.heading_degrees = (self.heading_degrees - self.turn_degrees) % 360.0
-        elif command is ControlCommand.FORWARD:
-            radians = math.radians(self.heading_degrees)
-            requested_x = self.x + self.forward_step * math.cos(radians)
-            requested_y = self.y + self.forward_step * math.sin(radians)
-            self.x, self.y = self._clamped_position(requested_x, requested_y)
-            if (self.x, self.y) != (requested_x, requested_y):
-                self.stop()
-                return
         self.is_moving = True
         self.active_command = command
+
+    def update(self, delta_time_s: float) -> None:
+        """Advance active motion by elapsed time, independently of frame rate."""
+        if isinstance(delta_time_s, bool) or not isinstance(delta_time_s, (int, float)):
+            raise ValueError("delta_time_s must be a finite non-negative number")
+        delta_time_s = float(delta_time_s)
+        if not math.isfinite(delta_time_s) or delta_time_s < 0:
+            raise ValueError("delta_time_s must be a finite non-negative number")
+        if not self.is_moving or self.active_command is None:
+            return
+        if self.active_command is ControlCommand.LEFT:
+            self.heading_degrees = (self.heading_degrees + self.turn_rate_degrees_s * delta_time_s) % 360.0
+            return
+        if self.active_command is ControlCommand.RIGHT:
+            self.heading_degrees = (self.heading_degrees - self.turn_rate_degrees_s * delta_time_s) % 360.0
+            return
+        direction = 1.0 if self.active_command is ControlCommand.FORWARD else -1.0
+        radians = math.radians(self.heading_degrees)
+        requested_x = self.x + direction * self.speed_units_s * delta_time_s * math.cos(radians)
+        requested_y = self.y + direction * self.speed_units_s * delta_time_s * math.sin(radians)
+        self.x, self.y = self._clamped_position(requested_x, requested_y)
+        if (self.x, self.y) != (requested_x, requested_y):
+            self.stop()
 
     def stop(self) -> None:
         """Idempotently stop the virtual car."""
@@ -141,7 +152,7 @@ class PsychoPyVirtualCarView:
         self._decision = visual.TextStim(win, pos=(0, -0.82), height=0.032, color="white", wrapWidth=1.8)
         self._help = visual.TextStim(
             win,
-            text="1 LEFT   2 RIGHT   3 FORWARD   4 STOP   U low confidence   Esc exit",
+            text="1 LEFT   2 RIGHT   3 FORWARD   4 BACKWARD   U low confidence   Esc exit",
             pos=(0, -0.92),
             height=0.026,
             color="white",

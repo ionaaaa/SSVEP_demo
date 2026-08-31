@@ -35,7 +35,7 @@ def _schedule(order: str = "fixed", seed: int = 42):
 def test_fixed_schedule_is_balanced_and_in_frequency_order() -> None:
     schedule = _schedule()
     assert [trial.target_frequency_hz for trial in schedule] == list(CONFIG.stimulus.frequencies_hz) * 3
-    assert [trial.command for trial in schedule[:4]] == ["LEFT", "RIGHT", "FORWARD", "STOP"]
+    assert [trial.command for trial in schedule[:4]] == ["LEFT", "RIGHT", "FORWARD", "BACKWARD"]
 
 
 def test_random_schedule_is_seed_reproducible_and_balanced() -> None:

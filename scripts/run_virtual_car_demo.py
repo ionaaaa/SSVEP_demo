@@ -61,7 +61,7 @@ def main() -> None:
     fullscreen = config.stimulus.fullscreen if args.fullscreen is None else args.fullscreen
     print(f"PsychoPy {psychopy.__version__}")
     print(f"Safety config: {config.control}")
-    print("Keys: 1=LEFT (8 Hz), 2=RIGHT (10 Hz), 3=FORWARD (12 Hz), 4=STOP (15 Hz), U=low confidence, Esc=exit")
+    print("Keys: 1=LEFT (8 Hz), 2=RIGHT (10 Hz), 3=FORWARD (12 Hz), 4=BACKWARD (15 Hz), U=low confidence, Esc=exit")
 
     win = visual.Window(
         size=config.stimulus.window_size,
@@ -92,10 +92,18 @@ def main() -> None:
     view = PsychoPyVirtualCarView(win, visual, config.control.confirmations_required)
     last_decision = None
     last_confidence = None
+    previous_frame_s = time.monotonic()
     try:
         running = True
         while running:
             now_s = time.monotonic()
+            frame_start_s = previous_frame_s
+            deadline = dispatcher.motion_deadline_s
+            elapsed_s = now_s - frame_start_s
+            if deadline is not None:
+                elapsed_s = max(0.0, min(now_s, deadline) - frame_start_s)
+            car.update(max(0.0, elapsed_s))
+            previous_frame_s = now_s
             for key in event.getKeys():
                 if key == "escape":
                     running = False

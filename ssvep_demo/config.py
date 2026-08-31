@@ -54,6 +54,15 @@ class UIConfig:
 
 
 @dataclass(frozen=True)
+class SyntheticDemoConfig:
+    """Deterministic settings for the explicitly simulated closed-loop demo."""
+
+    snr_db: float = 0.0
+    seed: int = 42
+    confirmations_required: int = 1
+
+
+@dataclass(frozen=True)
 class DemoConfig:
     stimulus: StimulusConfig
     acquisition: AcquisitionConfig
@@ -61,6 +70,7 @@ class DemoConfig:
     commands: dict[float, ControlCommand]
     ui: UIConfig = field(default_factory=UIConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
+    synthetic_demo: SyntheticDemoConfig = field(default_factory=SyntheticDemoConfig)
 
 
 def _mapping(value: Any, field_name: str) -> Mapping[str, Any]:
@@ -136,6 +146,7 @@ def load_config(path: str | Path) -> DemoConfig:
     commands_data = _mapping(_required(root, "commands", "root"), "commands")
     ui_data = _mapping(_optional(root, "ui", {}), "ui")
     control_data = _mapping(_optional(root, "control", {}), "control")
+    synthetic_data = _mapping(_optional(root, "synthetic_demo", {}), "synthetic_demo")
 
     frequencies_value = _required(stimulus_data, "frequencies", "stimulus")
     if not isinstance(frequencies_value, list) or not frequencies_value:
@@ -226,6 +237,8 @@ def load_config(path: str | Path) -> DemoConfig:
             raise ConfigurationError(f"commands values must be known control commands: {exc}") from exc
         if command is ControlCommand.UNKNOWN:
             raise ConfigurationError("commands values must not be UNKNOWN")
+        if command is ControlCommand.STOP:
+            raise ConfigurationError("commands values must not map a stimulus frequency to STOP")
         if frequency in commands:
             raise ConfigurationError("commands must not contain duplicate frequency mappings")
         commands[frequency] = command
@@ -257,6 +270,21 @@ def load_config(path: str | Path) -> DemoConfig:
         )
     except ValueError as exc:
         raise ConfigurationError(str(exc)) from exc
+    synthetic_seed = _optional(synthetic_data, "seed", 42)
+    synthetic_confirmations = _optional(synthetic_data, "confirmations_required", 1)
+    if isinstance(synthetic_seed, bool) or not isinstance(synthetic_seed, int) or synthetic_seed < 0:
+        raise ConfigurationError("synthetic_demo.seed must be a non-negative integer")
+    if (
+        isinstance(synthetic_confirmations, bool)
+        or not isinstance(synthetic_confirmations, int)
+        or synthetic_confirmations <= 0
+    ):
+        raise ConfigurationError("synthetic_demo.confirmations_required must be a positive integer")
+    synthetic_demo = SyntheticDemoConfig(
+        snr_db=_number(_optional(synthetic_data, "snr_db", 0.0), "synthetic_demo.snr_db"),
+        seed=synthetic_seed,
+        confirmations_required=synthetic_confirmations,
+    )
 
     return DemoConfig(
         stimulus=StimulusConfig(
@@ -280,4 +308,5 @@ def load_config(path: str | Path) -> DemoConfig:
         commands=commands,
         ui=ui,
         control=control,
+        synthetic_demo=synthetic_demo,
     )
