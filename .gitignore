@@ -1,0 +1,33 @@
+# Python bytecode, test, type-checking, and coverage artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.tox/
+.nox/
+
+# Python packaging and local environments
+*.egg-info/
+build/
+dist/
+*.whl
+*.egg
+.venv/
+venv/
+env/
+ENV/
+
+# Generated SSVEP evaluation and stimulus-session outputs
+outputs/
+results/
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+._*
