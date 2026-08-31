@@ -7,6 +7,7 @@ this module never opens a window and works in headless test environments.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import random
@@ -22,6 +23,76 @@ import numpy as np
 
 from .config import DemoConfig
 from .protocol import TrialMarker
+
+
+FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+DEFAULT_CJK_FONT_FILE = FONT_DIR / "NotoSansSC-Regular.otf"
+DEFAULT_CJK_FONT_NAME = "Noto Sans SC"
+DEFAULT_CJK_FONT_SHA256 = "faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9"
+
+
+@dataclass(frozen=True)
+class CJKFontSpec:
+    """Resolved CJK font information, independent of PsychoPy or a window."""
+
+    name: str
+    file: Path
+    source: str
+
+
+def resolve_cjk_font(
+    cli_file: str | Path | None,
+    cli_name: str | None,
+    config_file: str | Path | None,
+    config_name: str | None,
+    *,
+    config_directory: str | Path | None = None,
+) -> CJKFontSpec:
+    """Resolve CLI, YAML, or bundled CJK font paths without GUI dependencies.
+
+    CLI relative paths follow normal command-line semantics (the current working
+    directory). YAML relative paths are resolved against ``config_directory``.
+    The bundled font path is always resolved from this module's directory.
+    """
+    if cli_file is not None:
+        path = Path(cli_file).expanduser().resolve()
+        source = "cli"
+    elif config_file is not None:
+        configured = Path(config_file).expanduser()
+        if configured.is_absolute():
+            path = configured.resolve()
+        else:
+            if config_directory is None:
+                raise ValueError("config_directory is required for a relative YAML cjk_font_file")
+            path = (Path(config_directory).expanduser().resolve() / configured).resolve()
+        source = "yaml"
+    else:
+        path = DEFAULT_CJK_FONT_FILE
+        source = "bundled"
+    name = cli_name or config_name or DEFAULT_CJK_FONT_NAME
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("CJK font name must be a non-empty string")
+    if source == "bundled" and name != DEFAULT_CJK_FONT_NAME:
+        raise ValueError(
+            "A non-default CJK font name requires --cjk-font-file or ui.cjk_font_file; "
+            f"the bundled font name is '{DEFAULT_CJK_FONT_NAME}'."
+        )
+    _validate_font_file(path, name)
+    return CJKFontSpec(name=name, file=path, source=source)
+
+
+def _validate_font_file(path: Path, font_name: str) -> None:
+    guidance = "Specify a valid font with ui.cjk_font_file or --cjk-font-file and its matching name."
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"CJK font file does not exist: {path} (font name: {font_name}). {guidance}")
+    if path.stat().st_size == 0:
+        raise ValueError(f"CJK font file is empty: {path} (font name: {font_name}). {guidance}")
+    if path.suffix.lower() not in {".otf", ".ttf"}:
+        raise ValueError(f"CJK font file must be a static .otf or .ttf: {path} (font name: {font_name}). {guidance}")
+    if path == DEFAULT_CJK_FONT_FILE:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != DEFAULT_CJK_FONT_SHA256:
+            raise ValueError(f"Bundled CJK font failed integrity validation: {path}. {guidance}")
 
 
 class TrialState(str, Enum):
@@ -340,6 +411,8 @@ class PsychoPyStimulusRunner:
         screen_index: int | None = None,
         refresh_rate_hz: float | None = None,
         output_dir: str | Path = "outputs/ssvep_stimulus",
+        cjk_font_file: str | Path | None = None,
+        cjk_font_name: str | None = None,
     ) -> None:
         self.config = config
         self.config_path = Path(config_path)
@@ -351,6 +424,9 @@ class PsychoPyStimulusRunner:
         self.screen_index = config.stimulus.screen_index if screen_index is None else screen_index
         self.refresh_rate_override_hz = refresh_rate_hz
         self.output_dir = Path(output_dir)
+        self.cjk_font_file_override = cjk_font_file
+        self.cjk_font_name_override = cjk_font_name
+        self._cjk_font: CJKFontSpec | None = None
         self.schedule = build_trial_schedule(
             config.stimulus.frequencies_hz,
             config.stimulus.repetitions,
@@ -383,6 +459,14 @@ class PsychoPyStimulusRunner:
         )
         logger: _SessionLogger | None = None
         try:
+            self._cjk_font = resolve_cjk_font(
+                self.cjk_font_file_override,
+                self.cjk_font_name_override,
+                self.config.ui.cjk_font_file,
+                self.config.ui.cjk_font_name,
+                config_directory=self.config_path.expanduser().resolve().parent,
+            )
+            self._register_cjk_font(win, visual, self._cjk_font)
             measured_hz, refresh_source = self._measure_refresh_rate(win)
             nominal_interval_s = 1.0 / measured_hz
             win.recordFrameIntervals = True
@@ -408,7 +492,18 @@ class PsychoPyStimulusRunner:
                     "effective_frequency_estimation": "off_to_on_rising_edges / planned_duration",
                     "frequency_warnings": frequency_warnings,
                     "random_seed": self.config.stimulus.random_seed,
-                    "cli_overrides": {"fullscreen": self.fullscreen, "screen_index": self.screen_index, "refresh_rate_hz": self.refresh_rate_override_hz},
+                    "cjk_font": {
+                        "name": self._cjk_font.name,
+                        "file": str(self._cjk_font.file),
+                        "source": self._cjk_font.source,
+                    },
+                    "cli_overrides": {
+                        "fullscreen": self.fullscreen,
+                        "screen_index": self.screen_index,
+                        "refresh_rate_hz": self.refresh_rate_override_hz,
+                        "cjk_font_file": str(self.cjk_font_file_override) if self.cjk_font_file_override else None,
+                        "cjk_font_name": self.cjk_font_name_override,
+                    },
                 },
             )
             print(f"PsychoPy {psychopy.__version__}")
@@ -451,6 +546,19 @@ class PsychoPyStimulusRunner:
         if rate is None or not math.isfinite(rate) or rate <= 0:
             raise RuntimeError("PsychoPy could not measure refresh rate; pass --refresh-rate to override it.")
         return float(rate), "measured"
+
+    @staticmethod
+    def _register_cjk_font(win: Any, visual: Any, font: CJKFontSpec) -> None:
+        """Register an external font once, before any persistent text is made."""
+        try:
+            # TextStim's fontFiles loader registers the file with PsychoPy's
+            # backend. All later stimuli receive only the registered name.
+            visual.TextStim(win, text="", font=font.name, fontFiles=[str(font.file)], autoLog=False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to load CJK font file '{font.file}' as '{font.name}'. "
+                "Use ui.cjk_font_file/ui.cjk_font_name or --cjk-font-file/--cjk-font-name to provide a valid font."
+            ) from exc
 
     def _run_loop(
         self, win: Any, visual: Any, event: Any, logger: _SessionLogger, refresh_hz: float,
@@ -626,6 +734,8 @@ class PsychoPyStimulusRunner:
         })
 
     def _make_widgets(self, win: Any, visual: Any, estimates: dict[float, float]) -> dict[str, Any]:
+        if self._cjk_font is None:
+            raise RuntimeError("CJK font must be resolved and registered before creating widgets")
         positions = target_layout(len(self.config.stimulus.frequencies_hz))
         targets = {}
         for frequency, position in zip(self.config.stimulus.frequencies_hz, positions):
@@ -646,12 +756,26 @@ class PsychoPyStimulusRunner:
                     win, pos=(position[0], position[1] - 0.270), height=0.030,
                     text=f"实际 {estimates[frequency]:.2f} Hz",
                     color=(0.75, 0.75, 0.75),
+                    font=self._cjk_font.name,
+                    wrapWidth=0.40,
+                    alignText="center",
+                    anchorHoriz="center",
+                    anchorVert="center",
                 ),
             }
         return {
             "targets": targets,
-            "status": visual.TextStim(win, pos=(0, 0.86), height=0.05),
-            "detail": visual.TextStim(win, pos=(0, -0.86), height=0.04),
+            # Status/detail include Chinese instructions and therefore use the
+            # registered bundled/overridden CJK font. English-only target
+            # frequency and command labels retain PsychoPy's default font.
+            "status": visual.TextStim(
+                win, pos=(0, 0.84), height=0.047, font=self._cjk_font.name,
+                wrapWidth=1.80, alignText="center", anchorHoriz="center", anchorVert="center",
+            ),
+            "detail": visual.TextStim(
+                win, pos=(0, -0.82), height=0.034, font=self._cjk_font.name,
+                wrapWidth=1.72, alignText="center", anchorHoriz="center", anchorVert="center",
+            ),
             "fixation": visual.TextStim(win, text="+", pos=(0, 0), height=0.12),
         }
 
@@ -683,7 +807,7 @@ class PsychoPyStimulusRunner:
             self._draw_target_labels(target)
 
     def _draw_stimulation(self, widgets: dict[str, Any], states: dict[float, bool], trial: ScheduledTrial) -> None:
-        dropped_text = f"掉帧警告数: {self._drop_total}"
+        dropped_text = f"掉帧警告数：{self._drop_total}"
         self._draw_static(
             widgets,
             f"刺激  Trial {trial.trial_id + 1}/{len(self.schedule)}",

@@ -17,6 +17,12 @@ dependencies = [
 test = ["pytest>=7.0"]
 stimulus = ["psychopy>=2023.2"]
 
+[tool.setuptools]
+packages = ["ssvep_demo"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.setuptools.package-data]
+ssvep_demo = ["assets/fonts/*.otf", "assets/fonts/*.ttf", "assets/fonts/*.txt", "assets/fonts/*.md"]

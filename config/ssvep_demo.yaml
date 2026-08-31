@@ -30,3 +30,9 @@ commands:
   "10": RIGHT
   "12": FORWARD
   "15": STOP
+
+ui:
+  # Null selects the bundled Noto Sans CJK SC font. A relative override path
+  # is resolved relative to this YAML file, never the process working directory.
+  cjk_font_file: null
+  cjk_font_name: null

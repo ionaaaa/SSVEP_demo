@@ -25,6 +25,8 @@ def arguments() -> argparse.Namespace:
     parser.set_defaults(fullscreen=None)
     parser.add_argument("--screen-index", type=int)
     parser.add_argument("--refresh-rate", type=float, help="Measured-rate fallback or explicit debugging override.")
+    parser.add_argument("--cjk-font-file", type=Path, help="External static .otf/.ttf font; overrides YAML and bundled font.")
+    parser.add_argument("--cjk-font-name", help="Internal font family name for --cjk-font-file or YAML font file.")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "ssvep_stimulus")
     return parser.parse_args()
 
@@ -39,6 +41,8 @@ def main() -> None:
         screen_index=args.screen_index,
         refresh_rate_hz=args.refresh_rate,
         output_dir=args.output_dir,
+        cjk_font_file=args.cjk_font_file,
+        cjk_font_name=args.cjk_font_name,
     )
     runner.run()
 

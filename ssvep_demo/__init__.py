@@ -1,6 +1,6 @@
 """Shared configuration and data protocol for the SSVEP demonstration."""
 
-from .config import DemoConfig, load_config
+from .config import DemoConfig, UIConfig, load_config
 from .decoders import CCADecoder, FFTDecoder, SSVEPDecoder
 from .protocol import CANONICAL_CHANNELS, DecodeResult, EEGWindow, TrialMarker
 from .synthetic import SyntheticEEGSource
@@ -20,5 +20,6 @@ __all__ = [
     "TrialMarker",
     "TrialState",
     "TrialStateMachine",
+    "UIConfig",
     "load_config",
 ]

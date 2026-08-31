@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 from typing import Any, Mapping
@@ -45,11 +45,20 @@ class DecoderConfig:
 
 
 @dataclass(frozen=True)
+class UIConfig:
+    """Optional visual UI settings, kept separate from signal configuration."""
+
+    cjk_font_file: str | None = None
+    cjk_font_name: str | None = None
+
+
+@dataclass(frozen=True)
 class DemoConfig:
     stimulus: StimulusConfig
     acquisition: AcquisitionConfig
     decoder: DecoderConfig
     commands: dict[float, str]
+    ui: UIConfig = field(default_factory=UIConfig)
 
 
 def _mapping(value: Any, field_name: str) -> Mapping[str, Any]:
@@ -96,6 +105,14 @@ def _window_size(value: Any) -> tuple[int, int]:
     return (value[0], value[1])
 
 
+def _optional_string(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(f"{field_name} must be a non-empty string or null")
+    return value
+
+
 def _load_mapping(path: str | Path) -> Mapping[str, Any]:
     config_path = Path(path)
     try:
@@ -115,6 +132,7 @@ def load_config(path: str | Path) -> DemoConfig:
     acquisition_data = _mapping(_required(root, "acquisition", "root"), "acquisition")
     decoder_data = _mapping(_required(root, "decoder", "root"), "decoder")
     commands_data = _mapping(_required(root, "commands", "root"), "commands")
+    ui_data = _mapping(_optional(root, "ui", {}), "ui")
 
     frequencies_value = _required(stimulus_data, "frequencies", "stimulus")
     if not isinstance(frequencies_value, list) or not frequencies_value:
@@ -209,6 +227,11 @@ def load_config(path: str | Path) -> DemoConfig:
     if len(set(commands.values())) != len(commands):
         raise ConfigurationError("each stimulus frequency must have a unique command mapping")
 
+    ui = UIConfig(
+        cjk_font_file=_optional_string(_optional(ui_data, "cjk_font_file", None), "ui.cjk_font_file"),
+        cjk_font_name=_optional_string(_optional(ui_data, "cjk_font_name", None), "ui.cjk_font_name"),
+    )
+
     return DemoConfig(
         stimulus=StimulusConfig(
             frequencies,
@@ -229,4 +252,5 @@ def load_config(path: str | Path) -> DemoConfig:
         acquisition=AcquisitionConfig(sample_rate_hz, tuple(channels)),
         decoder=DecoderConfig(decoder_type, harmonics, bandpass_hz),
         commands=commands,
+        ui=ui,
     )

@@ -5,8 +5,11 @@ import pytest
 
 from ssvep_demo.config import load_config
 from ssvep_demo.stimulus import (
+    DEFAULT_CJK_FONT_FILE,
+    DEFAULT_CJK_FONT_NAME,
     FlickerScheduler,
     FlipMarkerRecorder,
+    PsychoPyStimulusRunner,
     TrialState,
     TrialStateMachine,
     build_trial_schedule,
@@ -14,6 +17,7 @@ from ssvep_demo.stimulus import (
     estimate_effective_frequency_hz,
     has_uneven_runs,
     planned_flicker_sequences,
+    resolve_cjk_font,
     static_target_states,
     target_layout,
 )
@@ -59,6 +63,78 @@ def test_targets_have_independent_phases_and_static_states_do_not_flicker() -> N
     alone_states = [alone.advance()[8.0] for _ in range(20)]
     assert together_states == alone_states
     assert static_target_states((8.0, 10.0, 12.0)) == {8.0: False, 10.0: False, 12.0: False}
+
+
+def test_cjk_text_is_unmodified_and_no_tracking_helper_remains() -> None:
+    import ssvep_demo.stimulus as stimulus_module
+
+    assert "double_cjk_tracking" not in stimulus_module.__dict__
+    assert "\u3000" not in Path(stimulus_module.__file__).read_text(encoding="utf-8")
+    assert "请注视目标" == "请注视目标"
+
+
+def test_resolve_cjk_font_defaults_to_bundled_font_independent_of_working_directory(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    font = resolve_cjk_font(None, None, None, None)
+    assert font.file == DEFAULT_CJK_FONT_FILE
+    assert font.name == DEFAULT_CJK_FONT_NAME
+    assert font.source == "bundled"
+    assert font.file.is_file() and font.file.stat().st_size > 0
+
+
+def test_cli_font_override_has_priority_over_yaml_and_default(tmp_path: Path) -> None:
+    cli_font = tmp_path / "cli.otf"
+    yaml_font = tmp_path / "yaml.otf"
+    cli_font.write_bytes(b"font")
+    yaml_font.write_bytes(b"font")
+    font = resolve_cjk_font(cli_font, "CLI Name", yaml_font, "YAML Name", config_directory=tmp_path)
+    assert (font.file, font.name, font.source) == (cli_font.resolve(), "CLI Name", "cli")
+
+
+def test_yaml_font_override_is_relative_to_config_directory(tmp_path: Path) -> None:
+    yaml_font = tmp_path / "fonts" / "custom.ttf"
+    yaml_font.parent.mkdir()
+    yaml_font.write_bytes(b"font")
+    font = resolve_cjk_font(None, None, Path("fonts/custom.ttf"), "Custom Name", config_directory=tmp_path)
+    assert (font.file, font.name, font.source) == (yaml_font.resolve(), "Custom Name", "yaml")
+
+
+@pytest.mark.parametrize("name, content, message", [("missing.otf", None, "does not exist"), ("empty.otf", b"", "is empty")])
+def test_invalid_font_files_fail_with_clear_error(tmp_path: Path, name: str, content: bytes | None, message: str) -> None:
+    font_file = tmp_path / name
+    if content is not None:
+        font_file.write_bytes(content)
+    with pytest.raises(ValueError, match=message):
+        resolve_cjk_font(font_file, "Broken Font", None, None)
+
+
+def test_all_chinese_text_widgets_use_one_cjk_font_and_keep_raw_text() -> None:
+    class FakeStim:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.text = kwargs.get("text", "")
+
+        def draw(self):
+            pass
+
+    class FakeVisual:
+        @staticmethod
+        def Rect(*_args, **kwargs):
+            return FakeStim(**kwargs)
+
+        @staticmethod
+        def TextStim(*_args, **kwargs):
+            return FakeStim(**kwargs)
+
+    runner = PsychoPyStimulusRunner(CONFIG, Path(__file__).parents[1] / "config" / "ssvep_demo.yaml")
+    runner._cjk_font = resolve_cjk_font(None, None, None, None)
+    widgets = runner._make_widgets(object(), FakeVisual, {frequency: frequency for frequency in CONFIG.stimulus.frequencies_hz})
+    assert widgets["status"].kwargs["font"] == DEFAULT_CJK_FONT_NAME
+    assert widgets["detail"].kwargs["font"] == DEFAULT_CJK_FONT_NAME
+    assert widgets["targets"][8.0]["estimate"].kwargs["font"] == DEFAULT_CJK_FONT_NAME
+    runner._draw_static(widgets, "请注视目标", "掉帧警告数：0")
+    assert widgets["status"].text == "请注视目标"
+    assert widgets["detail"].text == "掉帧警告数：0"
 
 
 def test_dropped_frame_detection_uses_strict_threshold() -> None:

@@ -24,10 +24,12 @@ def test_load_demo_config() -> None:
     assert config.commands == {8.0: "LEFT", 10.0: "RIGHT", 12.0: "FORWARD", 15.0: "STOP"}
     assert config.stimulus.cue_duration_s == 1.0
     assert config.stimulus.window_size == (1200, 800)
+    assert config.ui.cjk_font_file is None
 
 
 def test_old_config_without_visual_fields_uses_stimulus_defaults(tmp_path: Path) -> None:
     config = _base_config()
+    config.pop("ui")
     for field in (
         "cue_duration_s", "trial_order", "random_seed", "fullscreen", "window_size", "screen_index",
         "background_color", "stimulus_on_color", "stimulus_off_color", "dropped_frame_threshold_ratio",
@@ -39,6 +41,20 @@ def test_old_config_without_visual_fields_uses_stimulus_defaults(tmp_path: Path)
     loaded = load_config(path)
     assert loaded.stimulus.trial_order == "fixed"
     assert loaded.stimulus.dropped_frame_threshold_ratio == 1.5
+    assert loaded.ui.cjk_font_file is None
+
+
+def test_load_config_accepts_optional_cjk_font_override(tmp_path: Path) -> None:
+    config = _base_config()
+    config["ui"] = {"cjk_font_file": "fonts/custom.otf", "cjk_font_name": "Custom CJK"}
+    path = tmp_path / "font_override.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(path)
+    # The raw path is preserved; GUI-independent resolution later interprets it
+    # relative to the YAML file's directory.
+    assert loaded.ui.cjk_font_file == "fonts/custom.otf"
+    assert loaded.ui.cjk_font_name == "Custom CJK"
 
 
 @pytest.mark.parametrize(
