@@ -1,0 +1,10 @@
+{"event": "session_started", "monotonic_s": 14177.262462041, "utc_time": "2026-08-31T05:06:38.136197+00:00"}
+{"event": "cue_started", "monotonic_s": 14177.262730541, "utc_time": "2026-08-31T05:06:38.136444+00:00", "trial_id": 0, "target_frequency_hz": 8.0}
+{"event": "stimulation_scheduled", "monotonic_s": 14178.270707666, "utc_time": "2026-08-31T05:06:39.144432+00:00", "trial_id": 0, "planned_frame_count": 240}
+{"event": "stimulation_completed", "monotonic_s": 14182.308056125, "utc_time": "2026-08-31T05:06:43.181761+00:00", "trial_id": 0, "dropped_frame_count": 1}
+{"event": "cue_started", "monotonic_s": 14184.320252791, "utc_time": "2026-08-31T05:06:45.193930+00:00", "trial_id": 1, "target_frequency_hz": 10.0}
+{"event": "stimulation_scheduled", "monotonic_s": 14185.322370958, "utc_time": "2026-08-31T05:06:46.196048+00:00", "trial_id": 1, "planned_frame_count": 240}
+{"event": "pause", "monotonic_s": 14186.734552625, "utc_time": "2026-08-31T05:06:47.608217+00:00", "trial_id": 1, "paused_from": "STIMULATION"}
+{"event": "trial_aborted", "monotonic_s": 14186.734607208, "utc_time": "2026-08-31T05:06:47.608270+00:00", "trial_id": 1, "reason": "pause"}
+{"event": "session_stopped", "monotonic_s": 14194.698284125, "utc_time": "2026-08-31T05:06:55.571905+00:00"}
+{"event": "session_stopped", "monotonic_s": 14194.698326291, "utc_time": "2026-08-31T05:06:55.571946+00:00"}

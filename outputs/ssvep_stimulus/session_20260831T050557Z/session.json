@@ -1,0 +1,33 @@
+{
+  "created_utc": "2026-08-31T05:05:57.911651+00:00",
+  "psychopy_version": "2026.2.3",
+  "measured_refresh_rate_hz": 59.99339822647233,
+  "refresh_rate_source": "measured",
+  "requested_frequencies_hz": [
+    8.0,
+    10.0,
+    12.0,
+    15.0
+  ],
+  "estimated_frequencies_hz": {
+    "8.0": 7.999119763529645,
+    "10.0": 9.998899704412056,
+    "12.0": 11.998679645294468,
+    "15.0": 14.998349556618084
+  },
+  "effective_frequency_estimation": "off_to_on_rising_edges / planned_duration",
+  "frequency_warnings": {
+    "8.0": "non-uniform on/off frame runs approximate this frequency",
+    "10.0": null,
+    "12.0": null,
+    "15.0": null
+  },
+  "random_seed": 42,
+  "cli_overrides": {
+    "fullscreen": false,
+    "screen_index": 0,
+    "refresh_rate_hz": null
+  },
+  "session_dropped_frame_count": 2,
+  "final_state": "STOPPED"
+}

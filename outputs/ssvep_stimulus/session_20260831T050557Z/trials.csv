@@ -1,0 +1,3 @@
+trial_id,target_frequency_hz,command,trial_status,cue_start_monotonic_s,stimulus_start_monotonic_s,stimulus_end_monotonic_s,rest_start_monotonic_s,requested_frequency_hz,estimated_frequency_hz,measured_refresh_rate_hz,refresh_rate_source,planned_frame_count,actual_frame_count,dropped_frame_count,max_frame_interval_s,mean_frame_interval_s
+0,8.0,LEFT,completed,14177.262725833,14178.303797541,14182.303684333,14182.303684333,8.0,7.999119763529645,59.99339822647233,measured,240,240,1,0.03339058333403955,0.016735426867215897
+1,10.0,RIGHT,aborted,14184.320250458,14185.33734275,,,10.0,9.998899704412056,59.99339822647233,measured,240,76,1,0.16370862500116345,0.0185756847587838

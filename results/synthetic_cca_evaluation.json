@@ -1,0 +1,202 @@
+{
+  "decoder": "cca",
+  "seed": 42,
+  "trials_per_frequency": 100,
+  "config_path": "/Volumes/UBUNTU-SERV/SSVEP/config/ssvep_demo.yaml",
+  "candidate_frequencies_hz": [
+    8.0,
+    10.0,
+    12.0,
+    15.0
+  ],
+  "reports": [
+    {
+      "snr_db": -5.0,
+      "total_trials": 400,
+      "overall_accuracy": 1.0,
+      "per_frequency_accuracy": {
+        "8.0": 1.0,
+        "10.0": 1.0,
+        "12.0": 1.0,
+        "15.0": 1.0
+      },
+      "confusion_matrix": {
+        "labels_hz": [
+          8.0,
+          10.0,
+          12.0,
+          15.0
+        ],
+        "rows_actual_columns_predicted": [
+          [
+            100,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            100,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            100,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            100
+          ]
+        ]
+      },
+      "mean_confidence": 0.3266205820518977,
+      "elapsed_s": 0.8847386659981566
+    },
+    {
+      "snr_db": 0.0,
+      "total_trials": 400,
+      "overall_accuracy": 1.0,
+      "per_frequency_accuracy": {
+        "8.0": 1.0,
+        "10.0": 1.0,
+        "12.0": 1.0,
+        "15.0": 1.0
+      },
+      "confusion_matrix": {
+        "labels_hz": [
+          8.0,
+          10.0,
+          12.0,
+          15.0
+        ],
+        "rows_actual_columns_predicted": [
+          [
+            100,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            100,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            100,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            100
+          ]
+        ]
+      },
+      "mean_confidence": 0.19674523824454035,
+      "elapsed_s": 0.9945329590009351
+    },
+    {
+      "snr_db": 5.0,
+      "total_trials": 400,
+      "overall_accuracy": 1.0,
+      "per_frequency_accuracy": {
+        "8.0": 1.0,
+        "10.0": 1.0,
+        "12.0": 1.0,
+        "15.0": 1.0
+      },
+      "confusion_matrix": {
+        "labels_hz": [
+          8.0,
+          10.0,
+          12.0,
+          15.0
+        ],
+        "rows_actual_columns_predicted": [
+          [
+            100,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            100,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            100,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            100
+          ]
+        ]
+      },
+      "mean_confidence": 0.09526237026241907,
+      "elapsed_s": 0.8369483329988725
+    },
+    {
+      "snr_db": 10.0,
+      "total_trials": 400,
+      "overall_accuracy": 1.0,
+      "per_frequency_accuracy": {
+        "8.0": 1.0,
+        "10.0": 1.0,
+        "12.0": 1.0,
+        "15.0": 1.0
+      },
+      "confusion_matrix": {
+        "labels_hz": [
+          8.0,
+          10.0,
+          12.0,
+          15.0
+        ],
+        "rows_actual_columns_predicted": [
+          [
+            100,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            100,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            100,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            100
+          ]
+        ]
+      },
+      "mean_confidence": 0.04008501914666406,
+      "elapsed_s": 0.840304917001049
+    }
+  ]
+}

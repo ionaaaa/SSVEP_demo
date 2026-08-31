@@ -1,0 +1,32 @@
+stimulus:
+  frequencies: [8, 10, 12, 15]
+  trial_duration_s: 4.0
+  rest_duration_s: 2.0
+  cue_duration_s: 1.0
+  repetitions: 5
+  trial_order: fixed
+  random_seed: 42
+
+  fullscreen: false
+  window_size: [1200, 800]
+  screen_index: 0
+
+  background_color: [-1, -1, -1]
+  stimulus_on_color: [1, 1, 1]
+  stimulus_off_color: [-0.6, -0.6, -0.6]
+  dropped_frame_threshold_ratio: 1.5
+
+acquisition:
+  sample_rate_hz: 250
+  channels: [PO7, PO3, POz, PO4, PO8, O1, Oz, O2]
+
+decoder:
+  type: cca
+  harmonics: 3
+  bandpass_hz: [6, 45]
+
+commands:
+  "8": LEFT
+  "10": RIGHT
+  "12": FORWARD
+  "15": STOP
