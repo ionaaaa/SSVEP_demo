@@ -63,6 +63,23 @@ class SyntheticDemoConfig:
 
 
 @dataclass(frozen=True)
+class LiveConfig:
+    """Strict SSVEP-only live stream and trial collection contract."""
+
+    expected_sample_rate_hz: float = 250.0
+    source_channel_names: tuple[str, ...] = tuple(f"CH{index}" for index in range(1, 9))
+    channel_map: dict[str, str] = field(
+        default_factory=lambda: dict(zip((f"CH{index}" for index in range(1, 9)), CANONICAL_CHANNELS))
+    )
+    trial_samples: int = 1000
+    max_collection_wait_s: float = 1.0
+    ring_buffer_seconds: float = 15.0
+    queue_capacity: int = 4096
+    reconnect_initial_delay_s: float = 0.1
+    reconnect_max_delay_s: float = 5.0
+
+
+@dataclass(frozen=True)
 class DemoConfig:
     stimulus: StimulusConfig
     acquisition: AcquisitionConfig
@@ -71,6 +88,7 @@ class DemoConfig:
     ui: UIConfig = field(default_factory=UIConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
     synthetic_demo: SyntheticDemoConfig = field(default_factory=SyntheticDemoConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
 
 
 def _mapping(value: Any, field_name: str) -> Mapping[str, Any]:
@@ -147,6 +165,7 @@ def load_config(path: str | Path) -> DemoConfig:
     ui_data = _mapping(_optional(root, "ui", {}), "ui")
     control_data = _mapping(_optional(root, "control", {}), "control")
     synthetic_data = _mapping(_optional(root, "synthetic_demo", {}), "synthetic_demo")
+    live_data = _mapping(_optional(root, "live", {}), "live")
 
     frequencies_value = _required(stimulus_data, "frequencies", "stimulus")
     if not isinstance(frequencies_value, list) or not frequencies_value:
@@ -286,6 +305,69 @@ def load_config(path: str | Path) -> DemoConfig:
         confirmations_required=synthetic_confirmations,
     )
 
+    live_rate = _number(_optional(live_data, "expected_sample_rate_hz", 250), "live.expected_sample_rate_hz")
+    if live_rate != 250.0:
+        raise ConfigurationError("live.expected_sample_rate_hz must be exactly 250")
+    live_source_names = _optional(
+        live_data, "source_channel_names", [f"CH{index}" for index in range(1, 9)]
+    )
+    if (
+        not isinstance(live_source_names, list)
+        or len(live_source_names) != 8
+        or not all(isinstance(name, str) and name.strip() for name in live_source_names)
+        or len(set(live_source_names)) != 8
+    ):
+        raise ConfigurationError("live.source_channel_names must contain exactly 8 unique non-empty names")
+    live_map_data = _mapping(
+        _optional(live_data, "channel_map", dict(zip(live_source_names, CANONICAL_CHANNELS))),
+        "live.channel_map",
+    )
+    live_channel_map = dict(live_map_data)
+    if set(live_channel_map) != set(live_source_names):
+        raise ConfigurationError("live.channel_map keys must exactly match live.source_channel_names")
+    if (
+        not all(isinstance(value, str) for value in live_channel_map.values())
+        or tuple(sorted(live_channel_map.values())) != tuple(sorted(CANONICAL_CHANNELS))
+    ):
+        raise ConfigurationError("live.channel_map values must map once each to PO7, PO3, POz, PO4, PO8, O1, Oz, O2")
+    live_trial_samples = _optional(live_data, "trial_samples", 1000)
+    if isinstance(live_trial_samples, bool) or not isinstance(live_trial_samples, int) or live_trial_samples != 1000:
+        raise ConfigurationError("live.trial_samples must be exactly 1000 (4.0 s at 250 Hz)")
+    max_collection_wait_s = _number(
+        _optional(live_data, "max_collection_wait_s", 1.0), "live.max_collection_wait_s"
+    )
+    ring_buffer_seconds = _number(
+        _optional(live_data, "ring_buffer_seconds", 15.0), "live.ring_buffer_seconds"
+    )
+    if max_collection_wait_s < 0:
+        raise ConfigurationError("live.max_collection_wait_s must not be negative")
+    if not 10.0 <= ring_buffer_seconds <= 20.0:
+        raise ConfigurationError("live.ring_buffer_seconds must be between 10 and 20 seconds")
+    queue_capacity = _optional(live_data, "queue_capacity", 4096)
+    if isinstance(queue_capacity, bool) or not isinstance(queue_capacity, int) or queue_capacity <= 0:
+        raise ConfigurationError("live.queue_capacity must be a positive integer")
+    reconnect_initial = _number(
+        _optional(live_data, "reconnect_initial_delay_s", 0.1), "live.reconnect_initial_delay_s"
+    )
+    reconnect_max = _number(
+        _optional(live_data, "reconnect_max_delay_s", 5.0), "live.reconnect_max_delay_s"
+    )
+    if reconnect_initial <= 0 or reconnect_max < reconnect_initial:
+        raise ConfigurationError(
+            "live reconnect delays must be positive and max must be at least the initial delay"
+        )
+    live = LiveConfig(
+        expected_sample_rate_hz=live_rate,
+        source_channel_names=tuple(live_source_names),
+        channel_map=live_channel_map,
+        trial_samples=live_trial_samples,
+        max_collection_wait_s=max_collection_wait_s,
+        ring_buffer_seconds=ring_buffer_seconds,
+        queue_capacity=queue_capacity,
+        reconnect_initial_delay_s=reconnect_initial,
+        reconnect_max_delay_s=reconnect_max,
+    )
+
     return DemoConfig(
         stimulus=StimulusConfig(
             frequencies,
@@ -309,4 +391,5 @@ def load_config(path: str | Path) -> DemoConfig:
         ui=ui,
         control=control,
         synthetic_demo=synthetic_demo,
+        live=live,
     )

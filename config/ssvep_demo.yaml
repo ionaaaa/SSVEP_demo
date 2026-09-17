@@ -44,6 +44,27 @@ synthetic_demo:
   seed: 42
   confirmations_required: 1
 
+# Physical lead/cap wiring for the omniBCI stream. CH1..CH8 are transport
+# labels only; this explicit map assigns their SSVEP electrode semantics.
+live:
+  expected_sample_rate_hz: 250
+  source_channel_names: [CH1, CH2, CH3, CH4, CH5, CH6, CH7, CH8]
+  channel_map:
+    CH1: PO7
+    CH2: PO3
+    CH3: POz
+    CH4: PO4
+    CH5: PO8
+    CH6: O1
+    CH7: Oz
+    CH8: O2
+  trial_samples: 1000
+  max_collection_wait_s: 1.0
+  ring_buffer_seconds: 15.0
+  queue_capacity: 4096
+  reconnect_initial_delay_s: 0.1
+  reconnect_max_delay_s: 5.0
+
 ui:
   # Null selects the bundled Noto Sans CJK SC font. A relative override path
   # is resolved relative to this YAML file, never the process working directory.

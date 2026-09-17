@@ -39,6 +39,9 @@ class EEGWindowArchiveWriter:
         self._ends: list[float] = []
         self._targets: list[float] = []
         self._source_modes: list[str] = []
+        self._start_sequences: list[int] = []
+        self._end_sequences: list[int] = []
+        self._data_units: list[str] = []
         self.flush()
 
     def add(
@@ -49,6 +52,9 @@ class EEGWindowArchiveWriter:
         attempt_id: int,
         target_frequency_hz: float,
         source_mode: str,
+        start_sequence: int | None = None,
+        end_sequence: int | None = None,
+        data_unit: str = "arbitrary_signal_unit",
     ) -> int:
         if window.data.shape != (len(self.channel_names), self.samples_per_window):
             raise ValueError("EEG window shape does not match archive dense-array schema")
@@ -62,6 +68,19 @@ class EEGWindowArchiveWriter:
             raise ValueError("target_frequency_hz must be finite")
         if not isinstance(source_mode, str) or not source_mode:
             raise ValueError("source_mode must be a non-empty string")
+        if (start_sequence is None) != (end_sequence is None):
+            raise ValueError("start_sequence and end_sequence must either both be present or both be absent")
+        if start_sequence is not None and (
+            isinstance(start_sequence, bool)
+            or isinstance(end_sequence, bool)
+            or not isinstance(start_sequence, int)
+            or not isinstance(end_sequence, int)
+            or not 0 <= start_sequence < 2**32
+            or not 0 <= end_sequence < 2**32
+        ):
+            raise ValueError("stream sequences must be unsigned 32-bit integers")
+        if not isinstance(data_unit, str) or not data_unit:
+            raise ValueError("data_unit must be a non-empty string")
         index = len(self._windows)
         self._windows.append(np.asarray(window.data, dtype=np.float32).copy())
         self._trial_ids.append(trial_id)
@@ -71,6 +90,9 @@ class EEGWindowArchiveWriter:
         self._ends.append(float(window.end_time_s))
         self._targets.append(float(target_frequency_hz))
         self._source_modes.append(source_mode)
+        self._start_sequences.append(-1 if start_sequence is None else start_sequence)
+        self._end_sequences.append(-1 if end_sequence is None else end_sequence)
+        self._data_units.append(data_unit)
         self.flush()
         return index
 
@@ -94,7 +116,9 @@ class EEGWindowArchiveWriter:
             "window_end_monotonic_s": np.asarray(self._ends, dtype=np.float64),
             "target_frequency_hz": np.asarray(self._targets, dtype=np.float64),
             "source_mode": np.asarray(self._source_modes, dtype="U"),
-            "data_unit": np.asarray("arbitrary_signal_unit", dtype="U"),
+            "data_unit": np.asarray(self._data_units, dtype="U"),
+            "start_sequence": np.asarray(self._start_sequences, dtype=np.int64),
+            "end_sequence": np.asarray(self._end_sequences, dtype=np.int64),
         }
         if data.shape[0] != count:  # Defensive check before exposing the file.
             raise RuntimeError("internal EEG archive length mismatch")

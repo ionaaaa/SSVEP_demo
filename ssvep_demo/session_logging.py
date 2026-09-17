@@ -27,6 +27,10 @@ TRIAL_FIELDS = [
     "dispatcher_reason", "car_start_x", "car_start_y", "car_start_heading", "car_end_x", "car_end_y",
     "car_end_heading", "decoder_scores_json", "decoder_scores", "execution_start_monotonic_s",
     "execution_end_monotonic_s",
+    "source_mode", "server_url", "connection_state", "start_sequence", "end_sequence",
+    "received_samples", "expected_samples", "stream_gap_count", "invalid_frame_count",
+    "reconnect_count", "queue_overflow_count", "window_ready_monotonic_s", "collection_wait_ms",
+    "live_window_status", "live_window_failure_reason",
 ]
 
 
@@ -75,6 +79,18 @@ def resolved_config_dict(
             "snr_db": config.synthetic_demo.snr_db if synthetic_snr_db is None else synthetic_snr_db,
             "seed": config.synthetic_demo.seed if synthetic_seed is None else synthetic_seed,
             "confirmations_required": config.synthetic_demo.confirmations_required,
+        },
+        "live": {
+            "expected_sample_rate_hz": config.live.expected_sample_rate_hz,
+            "source_channel_names": list(config.live.source_channel_names),
+            "channel_map": dict(config.live.channel_map),
+            "mapped_channel_names": list(config.acquisition.channels),
+            "trial_samples": config.live.trial_samples,
+            "max_collection_wait_s": config.live.max_collection_wait_s,
+            "ring_buffer_seconds": config.live.ring_buffer_seconds,
+            "queue_capacity": config.live.queue_capacity,
+            "reconnect_initial_delay_s": config.live.reconnect_initial_delay_s,
+            "reconnect_max_delay_s": config.live.reconnect_max_delay_s,
         },
         "ui": {"cjk_font_file": config.ui.cjk_font_file, "cjk_font_name": config.ui.cjk_font_name},
     }
