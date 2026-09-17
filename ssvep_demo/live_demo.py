@@ -202,7 +202,8 @@ class _LiveDemoView:
         anomaly = live.recent_anomaly or "--"
         self.stream_text.text = (
             f"Live EEG: {live.connection_state}\n采样率：{rate}\n通道：{channels}\n"
-            f"Sequence: {sequence}\nSamples: {live.collected_samples} / {live.expected_samples}\n最近异常：{anomaly}"
+            f"Sequence: {sequence}\nAlignment: {live.alignment_mode_used or live.alignment_mode_requested or '--'}\n"
+            f"Samples: {live.collected_samples} / {live.expected_samples}\n最近异常：{anomaly}"
         )
         self.status_text.draw()
         self.stream_text.draw()
@@ -404,8 +405,31 @@ class SSVEPLiveDemoRunner:
         while self.state_machine.state not in {LiveDemoState.FINISHED, LiveDemoState.STOPPED}:
             self.live_source.poll()
             for source_event in self.live_source.take_events():
+                exact_event_names = {
+                    "stimulus_flip_sequence_snapshotted",
+                    "trigger_request_queued",
+                    "trigger_request_started",
+                    "trigger_response_received",
+                    "trigger_response_discarded",
+                    "trigger_alignment_ready",
+                    "trigger_alignment_failed",
+                    "live_window_ready",
+                }
+                event_payload: dict[str, Any] = {
+                    "source_monotonic_s": source_event.monotonic_s,
+                    "reason": source_event.reason,
+                    "detail": source_event.detail,
+                }
+                if source_event.detail:
+                    try:
+                        structured_detail = json.loads(source_event.detail)
+                    except (json.JSONDecodeError, TypeError):
+                        structured_detail = None
+                    if isinstance(structured_detail, dict):
+                        event_payload.update(structured_detail)
                 logger.event(
-                    f"live_{source_event.kind}", reason=source_event.reason, detail=source_event.detail
+                    source_event.kind if source_event.kind in exact_event_names else f"live_{source_event.kind}",
+                    **event_payload,
                 )
             live_status = self.live_source.status()
             now_s = time.monotonic()
@@ -504,7 +528,11 @@ class SSVEPLiveDemoRunner:
                         assert marker is not None
                         marker.mark_stimulus_start()
                         assert marker.stimulus_start_monotonic_s is not None
-                        self.live_source.begin_trial(marker.stimulus_start_monotonic_s)
+                        self.live_source.mark_stimulus_flip(
+                            trial_id=trial.trial_id,
+                            attempt_id=record["attempt_id"],
+                            stimulus_start_monotonic_s=marker.stimulus_start_monotonic_s,
+                        )
 
                     win.callOnFlip(begin_live_trial)
                 win.flip()
@@ -548,6 +576,7 @@ class SSVEPLiveDemoRunner:
                         start_sequence=status.start_sequence,
                         end_sequence=status.end_sequence,
                         data_unit="uV",
+                        alignment_mode=status.alignment_mode_used or "",
                     )
                     record["_window"] = window
                     self.state_machine.collection_complete()
@@ -674,6 +703,9 @@ class SSVEPLiveDemoRunner:
             "target_command": trial.command,
             "expected_samples": self.config.live.trial_samples,
             "eeg_window_index": None,
+            "alignment_mode_requested": self.config.live.alignment_mode,
+            "raw_input_unit": "uV",
+            "raw_input_preprocessing": "none",
         }
 
     def _apply_live_fields(
@@ -687,6 +719,19 @@ class SSVEPLiveDemoRunner:
             connection_state=status.connection_state,
             start_sequence=status.start_sequence,
             end_sequence=status.end_sequence,
+            alignment_mode_requested=status.alignment_mode_requested or self.config.live.alignment_mode,
+            alignment_mode_used=status.alignment_mode_used,
+            stimulus_flip_monotonic_s=status.stimulus_flip_monotonic_s,
+            sequence_at_flip=status.sequence_at_flip,
+            trigger_request_monotonic_s=status.trigger_request_monotonic_s,
+            trigger_response_monotonic_s=status.trigger_response_monotonic_s,
+            trigger_http_latency_ms=status.trigger_http_latency_ms,
+            trigger_sequence=status.trigger_sequence,
+            trigger_sequence_semantics=status.trigger_sequence_semantics,
+            window_start_sequence=status.window_start_sequence,
+            window_end_sequence=status.window_end_sequence,
+            raw_input_unit="uV",
+            raw_input_preprocessing="none",
             received_samples=status.collected_samples,
             expected_samples=status.expected_samples,
             stream_gap_count=status.stream_gap_count,

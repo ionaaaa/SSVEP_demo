@@ -42,6 +42,7 @@ class EEGWindowArchiveWriter:
         self._start_sequences: list[int] = []
         self._end_sequences: list[int] = []
         self._data_units: list[str] = []
+        self._alignment_modes: list[str] = []
         self.flush()
 
     def add(
@@ -55,6 +56,7 @@ class EEGWindowArchiveWriter:
         start_sequence: int | None = None,
         end_sequence: int | None = None,
         data_unit: str = "arbitrary_signal_unit",
+        alignment_mode: str = "",
     ) -> int:
         if window.data.shape != (len(self.channel_names), self.samples_per_window):
             raise ValueError("EEG window shape does not match archive dense-array schema")
@@ -81,6 +83,8 @@ class EEGWindowArchiveWriter:
             raise ValueError("stream sequences must be unsigned 32-bit integers")
         if not isinstance(data_unit, str) or not data_unit:
             raise ValueError("data_unit must be a non-empty string")
+        if not isinstance(alignment_mode, str):
+            raise ValueError("alignment_mode must be a string")
         index = len(self._windows)
         self._windows.append(np.asarray(window.data, dtype=np.float32).copy())
         self._trial_ids.append(trial_id)
@@ -93,6 +97,7 @@ class EEGWindowArchiveWriter:
         self._start_sequences.append(-1 if start_sequence is None else start_sequence)
         self._end_sequences.append(-1 if end_sequence is None else end_sequence)
         self._data_units.append(data_unit)
+        self._alignment_modes.append(alignment_mode)
         self.flush()
         return index
 
@@ -119,6 +124,7 @@ class EEGWindowArchiveWriter:
             "data_unit": np.asarray(self._data_units, dtype="U"),
             "start_sequence": np.asarray(self._start_sequences, dtype=np.int64),
             "end_sequence": np.asarray(self._end_sequences, dtype=np.int64),
+            "alignment_mode": np.asarray(self._alignment_modes, dtype="U"),
         }
         if data.shape[0] != count:  # Defensive check before exposing the file.
             raise RuntimeError("internal EEG archive length mismatch")

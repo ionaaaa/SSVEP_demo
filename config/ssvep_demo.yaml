@@ -60,7 +60,12 @@ live:
     CH8: O2
   trial_samples: 1000
   max_collection_wait_s: 1.0
-  ring_buffer_seconds: 15.0
+  # buffer_sequence is software-side receive-buffer alignment only; trigger
+  # uses omniBCI-R's event-aligned device sequence. Neither proves photon onset.
+  alignment_mode: buffer_sequence
+  ring_buffer_seconds: 20.0
+  trigger_url: null
+  trigger_timeout_s: 0.5
   queue_capacity: 4096
   reconnect_initial_delay_s: 0.1
   reconnect_max_delay_s: 5.0

@@ -73,7 +73,10 @@ class LiveConfig:
     )
     trial_samples: int = 1000
     max_collection_wait_s: float = 1.0
-    ring_buffer_seconds: float = 15.0
+    alignment_mode: str = "buffer_sequence"
+    ring_buffer_seconds: float = 20.0
+    trigger_url: str | None = None
+    trigger_timeout_s: float = 0.5
     queue_capacity: int = 4096
     reconnect_initial_delay_s: float = 0.1
     reconnect_max_delay_s: float = 5.0
@@ -336,13 +339,26 @@ def load_config(path: str | Path) -> DemoConfig:
     max_collection_wait_s = _number(
         _optional(live_data, "max_collection_wait_s", 1.0), "live.max_collection_wait_s"
     )
+    alignment_mode = _optional(live_data, "alignment_mode", "buffer_sequence")
+    if alignment_mode not in {"buffer_sequence", "trigger"}:
+        raise ConfigurationError("live.alignment_mode must be 'buffer_sequence' or 'trigger'")
     ring_buffer_seconds = _number(
-        _optional(live_data, "ring_buffer_seconds", 15.0), "live.ring_buffer_seconds"
+        _optional(live_data, "ring_buffer_seconds", 20.0), "live.ring_buffer_seconds"
+    )
+    trigger_url = _optional_string(_optional(live_data, "trigger_url", None), "live.trigger_url")
+    if trigger_url is not None and not trigger_url.startswith(("http://", "https://")):
+        raise ConfigurationError("live.trigger_url must be an http:// or https:// URL")
+    trigger_timeout_s = _number(
+        _optional(live_data, "trigger_timeout_s", 0.5), "live.trigger_timeout_s"
     )
     if max_collection_wait_s < 0:
         raise ConfigurationError("live.max_collection_wait_s must not be negative")
     if not 10.0 <= ring_buffer_seconds <= 20.0:
         raise ConfigurationError("live.ring_buffer_seconds must be between 10 and 20 seconds")
+    if trigger_timeout_s <= 0:
+        raise ConfigurationError("live.trigger_timeout_s must be greater than zero")
+    if alignment_mode == "trigger" and trigger_url is None:
+        raise ConfigurationError("live.trigger_url is required when live.alignment_mode is 'trigger'")
     queue_capacity = _optional(live_data, "queue_capacity", 4096)
     if isinstance(queue_capacity, bool) or not isinstance(queue_capacity, int) or queue_capacity <= 0:
         raise ConfigurationError("live.queue_capacity must be a positive integer")
@@ -362,7 +378,10 @@ def load_config(path: str | Path) -> DemoConfig:
         channel_map=live_channel_map,
         trial_samples=live_trial_samples,
         max_collection_wait_s=max_collection_wait_s,
+        alignment_mode=alignment_mode,
         ring_buffer_seconds=ring_buffer_seconds,
+        trigger_url=trigger_url,
+        trigger_timeout_s=trigger_timeout_s,
         queue_capacity=queue_capacity,
         reconnect_initial_delay_s=reconnect_initial,
         reconnect_max_delay_s=reconnect_max,

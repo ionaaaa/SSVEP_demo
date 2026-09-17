@@ -2,6 +2,7 @@ import json
 import asyncio
 from dataclasses import replace
 from pathlib import Path
+import threading
 import time
 
 import numpy as np
@@ -10,13 +11,17 @@ import yaml
 
 from ssvep_demo.config import load_config
 from ssvep_demo.eeg_archive import EEGWindowArchiveWriter, ReplayEEGSource
+from ssvep_demo.decoders import FFTDecoder
 from ssvep_demo.live_demo import LiveDemoState, LiveTrialCoordinator, SSVEPLiveDemoRunner
 from ssvep_demo.live_source import (
     LiveProtocolError,
     LiveSampleFrame,
     LiveStreamMetadata,
     OmniBCIWebSocketSource,
+    TRIGGER_SEQUENCE_SEMANTICS,
     UINT32_MAX,
+    _TriggerRequest,
+    _TriggerResult,
     _WorkerEvent,
     parse_omnibci_message,
 )
@@ -58,9 +63,16 @@ def _payload(
     )
 
 
-def _ready_source(*, queue_capacity=None):
-    live_config = CONFIG.live if queue_capacity is None else replace(CONFIG.live, queue_capacity=queue_capacity)
-    source = OmniBCIWebSocketSource("ws://127.0.0.1:1/v1/stream", live_config)
+def _ready_source(*, queue_capacity=None, alignment_mode="buffer_sequence", trigger_http_post=None):
+    updates = {"alignment_mode": alignment_mode}
+    if queue_capacity is not None:
+        updates["queue_capacity"] = queue_capacity
+    if alignment_mode == "trigger":
+        updates["trigger_url"] = "http://127.0.0.1:1/v1/trigger"
+    live_config = replace(CONFIG.live, **updates)
+    source = OmniBCIWebSocketSource(
+        "ws://127.0.0.1:1/v1/stream", live_config, trigger_http_post=trigger_http_post
+    )
     source._started = True
     source._connection_state = "connected"
     metadata = LiveStreamMetadata(250.0, SOURCE_NAMES, CANONICAL_CHANNELS)
@@ -73,6 +85,17 @@ def _feed(source, message, *, clock_start=1.0):
     parsed = parse_omnibci_message(message, source.config, clock=lambda: next(ticks))
     for frame in parsed.frames:
         source._handle_event(_WorkerEvent("frame", frame.received_monotonic_s, frame=frame))
+    source._try_collect_from_ring()
+
+
+def _begin(source, start_sequence, *, trial_id=0, attempt_id=0, started_s=0.0, mode="buffer_sequence"):
+    source.begin_trial(
+        trial_id=trial_id,
+        attempt_id=attempt_id,
+        stimulus_start_monotonic_s=started_s,
+        start_sequence=start_sequence,
+        alignment_mode=mode,
+    )
 
 
 def test_actual_batch_message_parses_frames_and_maps_ch1_through_ch8() -> None:
@@ -108,12 +131,59 @@ def test_parser_rejects_conflicting_explicit_unit() -> None:
         parse_omnibci_message(json.dumps(payload), CONFIG.live)
 
 
+def test_raw_microvolts_only_undergo_channel_reorder_and_axis_transpose() -> None:
+    reverse_map = dict(zip(SOURCE_NAMES, reversed(CANONICAL_CHANNELS)))
+    live_config = replace(CONFIG.live, channel_map=reverse_map)
+    source = OmniBCIWebSocketSource("ws://127.0.0.1:1/v1/stream", live_config)
+    source._started = True
+    source._connection_state = "connected"
+    source._handle_event(_WorkerEvent(
+        "metadata", 0.0,
+        metadata=LiveStreamMetadata(250.0, SOURCE_NAMES, CANONICAL_CHANNELS),
+    ))
+    _begin(source, 0)
+    raw_samples = np.asarray(
+        [[sample * 0.125 + channel + 0.03125 for channel in range(8)] for sample in range(1000)],
+        dtype=np.float32,
+    )
+    _feed(
+        source,
+        _payload(range(1000), value_factory=lambda sample, channel: float(raw_samples[sample, channel])),
+    )
+    window = source.try_take_completed_window()
+    assert window is not None
+    assert np.array_equal(window.data, raw_samples[:, ::-1].T)
+    assert window.data.dtype == np.float32
+
+
+def test_decoder_bandpass_runs_once_after_live_collection(monkeypatch) -> None:
+    source = _ready_source()
+    _begin(source, 0)
+    _feed(source, _payload(range(1000), value_factory=lambda sample, channel: np.sin(sample / 10) + channel))
+    window = source.try_take_completed_window()
+    assert window is not None
+
+    import ssvep_demo.decoders as decoder_module
+    original = decoder_module.signal.sosfiltfilt
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(decoder_module.signal, "sosfiltfilt", counted)
+    FFTDecoder(CONFIG).decode(window)
+    assert len(calls) == 1
+
+
 def test_config_rejects_invalid_live_mapping_and_contract(tmp_path: Path) -> None:
     base = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     cases = [
         (lambda value: value["live"].update(expected_sample_rate_hz=500), "exactly 250"),
         (lambda value: value["live"].update(trial_samples=999), "exactly 1000"),
         (lambda value: value["live"]["channel_map"].update(CH8="Oz"), "map once each"),
+        (lambda value: value["live"].update(alignment_mode="arrival_time"), "alignment_mode"),
+        (lambda value: value["live"].update(alignment_mode="trigger", trigger_url=None), "trigger_url"),
     ]
     for index, (mutate, expected) in enumerate(cases):
         value = json.loads(json.dumps(base))
@@ -126,7 +196,7 @@ def test_config_rejects_invalid_live_mapping_and_contract(tmp_path: Path) -> Non
 
 def test_exactly_1000_consecutive_frames_form_channel_major_window() -> None:
     source = _ready_source()
-    source.begin_trial(0.5)
+    _begin(source, 100, started_s=0.5)
     # The 1001st and later samples are deliberately ignored after completion.
     _feed(source, _payload(range(100, 1101)))
     status = source.status()
@@ -140,10 +210,20 @@ def test_exactly_1000_consecutive_frames_form_channel_major_window() -> None:
 
 def test_999_frames_never_produce_decoder_input() -> None:
     source = _ready_source()
-    source.begin_trial(0.5)
+    _begin(source, 10, started_s=0.5)
     _feed(source, _payload(range(10, 1009)))
     assert source.status().collected_samples == 999
     assert source.try_take_completed_window() is None
+
+
+def test_sample_after_exact_window_is_never_collected_or_used_to_invalidate_it() -> None:
+    source = _ready_source()
+    _begin(source, 100)
+    _feed(source, _payload(range(100, 1101), valid=lambda sequence: sequence != 1100))
+    window = source.try_take_completed_window()
+    assert window is not None and window.data.shape == (8, 1000)
+    assert source.status().end_sequence == 1099
+    assert source.status().trial_failure_reason is None
 
 
 @pytest.mark.parametrize(
@@ -157,7 +237,7 @@ def test_999_frames_never_produce_decoder_input() -> None:
 )
 def test_discontinuities_and_invalid_frame_abort_current_trial(sequences, valid, expected_reason) -> None:
     source = _ready_source()
-    source.begin_trial(0.5)
+    _begin(source, 10, started_s=0.5)
     _feed(source, _payload(sequences, valid=valid))
     assert source.status().trial_failure_reason == expected_reason
     assert source.try_take_completed_window() is None
@@ -165,18 +245,18 @@ def test_discontinuities_and_invalid_frame_abort_current_trial(sequences, valid,
 
 def test_disconnect_reconnect_and_queue_overflow_abort_current_trial() -> None:
     source = _ready_source(queue_capacity=1)
-    source.begin_trial(0.0)
+    _begin(source, 1)
     source._handle_event(_WorkerEvent("disconnected", 1.0, reason="stream_disconnected"))
     assert source.status().trial_failure_reason == "stream_disconnected"
 
     source._connection_state = "connected"
-    source.begin_trial(1.1)
+    _begin(source, 1, attempt_id=1, started_s=1.1)
     source._handle_event(_WorkerEvent("reconnected", 1.2))
     assert source.status().trial_failure_reason == "stream_reconnected"
     assert source.status().reconnect_count == 1
 
     source._connection_state = "connected"
-    source.begin_trial(1.3)
+    _begin(source, 1, attempt_id=2, started_s=1.3)
     source._put_event(_WorkerEvent("connecting", 1.4))
     source._put_event(_WorkerEvent("frame", 1.5, frame=LiveSampleFrame(1, True, np.zeros(8), 1.5)))
     source.poll()
@@ -186,40 +266,149 @@ def test_disconnect_reconnect_and_queue_overflow_abort_current_trial() -> None:
 
 def test_protocol_error_and_metadata_change_abort_current_trial() -> None:
     source = _ready_source()
-    source.begin_trial(0.0)
+    _begin(source, 1)
     source._handle_event(_WorkerEvent("protocol_error", 1.0, reason="protocol_error", detail="bad JSON"))
     assert source.status().trial_failure_reason == "protocol_error"
 
     source._connection_state = "connected"
-    source.begin_trial(1.1)
+    _begin(source, 1, attempt_id=1, started_s=1.1)
     changed = LiveStreamMetadata(250.0, SOURCE_NAMES, tuple(reversed(CANONICAL_CHANNELS)))
     source._handle_event(_WorkerEvent("metadata_changed", 1.2, metadata=changed, reason="metadata_mismatch"))
     assert source.status().trial_failure_reason == "metadata_mismatch"
 
 
-def test_pre_flip_frames_are_ignored_first_post_flip_sequence_starts_trial() -> None:
+def test_buffer_sequence_flip_snapshot_starts_strictly_at_next_sequence() -> None:
     source = _ready_source()
     old = parse_omnibci_message(_payload([20]), CONFIG.live, clock=lambda: 0.9).frames[0]
-    source.begin_trial(1.0)
     source._handle_event(_WorkerEvent("frame", 0.9, frame=old))
-    new = parse_omnibci_message(_payload([21]), CONFIG.live, clock=lambda: 1.01).frames[0]
-    source._handle_event(_WorkerEvent("frame", 1.01, frame=new))
+    source.mark_stimulus_flip(trial_id=3, attempt_id=2, stimulus_start_monotonic_s=1.0)
+    _feed(source, _payload(range(21, 1021)), clock_start=1.01)
+    window = source.try_take_completed_window()
+    assert window is not None
     assert source.status().start_sequence == 21
-    assert source.status().collected_samples == 1
+    assert source.status().end_sequence == 1020
+    assert source.status().sequence_at_flip == 20
+    assert window.data[0, 0] == 210
+    assert not np.any(window.data == 200)
+
+
+def test_buffer_sequence_without_a_valid_sequence_at_flip_fails() -> None:
+    source = _ready_source()
+    source.mark_stimulus_flip(trial_id=0, attempt_id=0, stimulus_start_monotonic_s=1.0)
+    assert source.status().trial_failure_reason == "no_sequence_at_flip"
+    assert source.try_take_completed_window() is None
+
+
+def test_trigger_sequence_is_inclusive_and_can_extract_existing_ring_data() -> None:
+    source = _ready_source(alignment_mode="trigger")
+    _feed(source, _payload(range(100, 1100)), clock_start=1.0)
+    source.mark_stimulus_flip(trial_id=4, attempt_id=7, stimulus_start_monotonic_s=5.0)
+    request = _TriggerRequest(4, 7, 5.001)
+    result = _TriggerResult(
+        request, 5.002, 5.012,
+        payload={"accepted": True, "sequence": 100, "sample_index": 1234, "code": 1},
+    )
+    source._handle_trigger_event("trigger_response", result)
+    window = source.try_take_completed_window()
+    status = source.status()
+    assert window is not None and window.data.shape == (8, 1000)
+    assert status.start_sequence == 100 and status.end_sequence == 1099
+    assert status.trigger_sequence == 100
+    assert status.trigger_sequence_semantics == TRIGGER_SEQUENCE_SEMANTICS
+    assert status.alignment_mode_used == "trigger"
+
+
+def test_trigger_callback_only_enqueues_and_http_runs_in_background() -> None:
+    calls = []
+
+    def slow_post(url, payload, timeout):
+        calls.append((threading.current_thread().name, url, payload, timeout))
+        time.sleep(0.08)
+        return {"accepted": True, "sequence": 10}
+
+    source = _ready_source(alignment_mode="trigger", trigger_http_post=slow_post)
+    source._trigger_thread = threading.Thread(target=source._trigger_worker, name="test-trigger-worker", daemon=True)
+    source._trigger_thread.start()
+    started = time.perf_counter()
+    source.mark_stimulus_flip(trial_id=1, attempt_id=2, stimulus_start_monotonic_s=1.0)
+    assert time.perf_counter() - started < 0.03
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and source.status().trigger_sequence is None:
+        source.poll()
+        time.sleep(0.002)
+    source.close()
+    assert calls
+    worker_name, url, payload, timeout = calls[0]
+    assert worker_name == "test-trigger-worker"
+    assert url.endswith("/v1/trigger") and timeout == 0.5
+    assert payload == {"code": 1, "label": "ssvep trial_id=1 attempt_id=2"}
+
+
+def test_stale_trigger_response_is_discarded() -> None:
+    source = _ready_source(alignment_mode="trigger")
+    source.mark_stimulus_flip(trial_id=1, attempt_id=0, stimulus_start_monotonic_s=1.0)
+    old_request = _TriggerRequest(1, 0, 1.0)
+    source.mark_stimulus_flip(trial_id=1, attempt_id=1, stimulus_start_monotonic_s=2.0)
+    source._handle_trigger_event(
+        "trigger_response",
+        _TriggerResult(old_request, 1.1, 2.1, payload={"accepted": True, "sequence": 10}),
+    )
+    assert source.status().trigger_sequence is None
+    assert source.status().alignment_mode_used is None
+    assert any(event.kind == "trigger_response_discarded" for event in source.take_events())
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload", "reason"),
+    [
+        ("trigger_failed", None, "trigger_timeout"),
+        ("trigger_failed", None, "trigger_http_error"),
+        ("trigger_response", {"accepted": True}, "trigger_invalid_response"),
+        ("trigger_response", {"accepted": False, "sequence": 10}, "trigger_invalid_response"),
+    ],
+)
+def test_trigger_failures_never_fall_back_to_buffer_sequence(kind, payload, reason) -> None:
+    source = _ready_source(alignment_mode="trigger")
+    _feed(source, _payload([9]))
+    source.mark_stimulus_flip(trial_id=0, attempt_id=0, stimulus_start_monotonic_s=2.0)
+    request = _TriggerRequest(0, 0, 2.0)
+    result = _TriggerResult(
+        request, 2.01, 2.02, payload=payload,
+        reason=reason if kind == "trigger_failed" else None,
+    )
+    source._handle_trigger_event(kind, result)
+    status = source.status()
+    assert status.trial_failure_reason == reason
+    assert status.alignment_mode_used is None
+    assert source.try_take_completed_window() is None
+
+
+def test_missing_or_discontinuous_trigger_range_fails() -> None:
+    missing = _ready_source(alignment_mode="trigger")
+    _feed(missing, _payload(range(1000, 2000)))
+    _begin(missing, 10, mode="trigger")
+    assert missing.status().trial_failure_reason == "sequence_not_in_buffer"
+
+    gap = _ready_source(alignment_mode="trigger")
+    _begin(gap, 10, mode="trigger")
+    _feed(gap, _payload([10, 12]))
+    assert gap.status().trial_failure_reason == "sequence_gap"
+    assert gap.try_take_completed_window() is None
 
 
 def test_gap_samples_never_mix_and_u32_rollover_is_explicitly_continuous() -> None:
     source = _ready_source()
-    source.begin_trial(0.0)
+    _begin(source, 40)
     _feed(source, _payload([40, 42]))
     assert source.status().received_samples == 1
-    source.begin_trial(2.0)
+    assert source.try_take_completed_window() is None
+    _begin(source, 43, attempt_id=1, started_s=2.0)
     _feed(source, _payload(range(43, 1043)), clock_start=2.1)
     window = source.try_take_completed_window()
     assert window is not None and source.status().start_sequence == 43
 
     rollover = _ready_source()
-    rollover.begin_trial(0.0)
+    _begin(rollover, UINT32_MAX)
     _feed(rollover, _payload([UINT32_MAX, 0]))
     assert rollover.status().trial_failure_reason is None
     assert rollover.status().collected_samples == 2
@@ -248,7 +437,7 @@ class _CountingDispatcher:
 
 def test_decoder_receives_only_complete_unlabeled_window_once() -> None:
     source = _ready_source()
-    source.begin_trial(0.0)
+    _begin(source, 0)
     _feed(source, _payload(range(1000)))
     decoder, dispatcher = _CountingDecoder(), _CountingDispatcher()
     coordinator = LiveTrialCoordinator(decoder, dispatcher)
@@ -258,7 +447,7 @@ def test_decoder_receives_only_complete_unlabeled_window_once() -> None:
     assert decoder.calls == dispatcher.calls == 1
 
     incomplete = _ready_source()
-    incomplete.begin_trial(0.0)
+    _begin(incomplete, 0)
     _feed(incomplete, _payload(range(999)))
     assert incomplete.try_take_completed_window() is None
     assert decoder.calls == dispatcher.calls == 1
@@ -266,7 +455,7 @@ def test_decoder_receives_only_complete_unlabeled_window_once() -> None:
 
 def test_live_window_archive_preserves_sequences_and_replays(tmp_path: Path) -> None:
     source = _ready_source()
-    source.begin_trial(0.0)
+    _begin(source, 500)
     _feed(source, _payload(range(500, 1500)))
     window = source.try_take_completed_window()
     status = source.status()
@@ -275,6 +464,7 @@ def test_live_window_archive_preserves_sequences_and_replays(tmp_path: Path) -> 
     writer.add(
         window, trial_id=2, attempt_id=0, target_frequency_hz=10.0, source_mode="live",
         start_sequence=status.start_sequence, end_sequence=status.end_sequence, data_unit="uV",
+        alignment_mode="buffer_sequence",
     )
     replay = ReplayEEGSource(writer.path)
     assert np.array_equal(replay.window(0).data, window.data)
@@ -283,6 +473,7 @@ def test_live_window_archive_preserves_sequences_and_replays(tmp_path: Path) -> 
         assert archive["data_unit"].tolist() == ["uV"]
         assert archive["start_sequence"].tolist() == [500]
         assert archive["end_sequence"].tolist() == [1499]
+        assert archive["alignment_mode"].tolist() == ["buffer_sequence"]
 
 
 def test_poll_is_nonblocking_close_is_idempotent_and_import_is_headless() -> None:
@@ -339,7 +530,7 @@ def test_background_async_worker_delivers_typed_frames_without_blocking_main_thr
         source.poll()
         status = source.status()
         if not begun and status.connection_state == "connected" and status.metadata is not None:
-            source.begin_trial(time.monotonic())
+            source.mark_stimulus_flip(trial_id=0, attempt_id=0, stimulus_start_monotonic_s=time.monotonic())
             begun = True
         window = source.try_take_completed_window()
         time.sleep(0.001)
@@ -363,7 +554,7 @@ def test_escape_aborts_live_trial_and_stops_controller() -> None:
     from ssvep_demo.virtual_car import VirtualCarController
 
     source = _ready_source()
-    source.begin_trial(0.0)
+    _begin(source, 0)
     runner = SSVEPLiveDemoRunner(
         CONFIG, CONFIG_PATH, server_url="ws://127.0.0.1:8766/v1/stream", max_trials=1, live_source=source
     )

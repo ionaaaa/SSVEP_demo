@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import sys
 from pathlib import Path
 
@@ -23,6 +24,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["synthetic", "replay", "live"], default="synthetic")
     parser.add_argument("--source", help="Live input source; currently only omnibci-websocket is supported.")
     parser.add_argument("--server-url", help="Live WebSocket endpoint, e.g. ws://127.0.0.1:8766/v1/stream")
+    parser.add_argument("--alignment-mode", choices=["buffer-sequence", "trigger"], help="Live stimulus/EEG alignment strategy.")
+    parser.add_argument("--trigger-url", help="Existing omniBCI Trigger endpoint, e.g. http://127.0.0.1:8766/v1/trigger")
     parser.add_argument("--decoder", choices=["fft", "cca"])
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ssvep_demo.yaml")
     parser.add_argument("--snr-db", type=float)
@@ -57,6 +60,13 @@ def main() -> None:
             raise SystemExit("--replay-file cannot be used when --mode live")
         if args.no_gui:
             raise SystemExit("--no-gui is not supported in live mode because collection is stimulus-trial aligned")
+        alignment_mode = (
+            args.alignment_mode.replace("-", "_") if args.alignment_mode is not None else config.live.alignment_mode
+        )
+        trigger_url = args.trigger_url if args.trigger_url is not None else config.live.trigger_url
+        if alignment_mode == "trigger" and trigger_url is None:
+            raise SystemExit("--trigger-url is required when --alignment-mode trigger")
+        config = replace(config, live=replace(config.live, alignment_mode=alignment_mode, trigger_url=trigger_url))
         print("LIVE EEG MODE: omniBCI WebSocket input; no synthetic or replay EEG is used.")
         runner = SSVEPLiveDemoRunner(
             config,
