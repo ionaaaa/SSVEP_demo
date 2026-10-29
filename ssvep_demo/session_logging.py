@@ -27,6 +27,14 @@ TRIAL_FIELDS = [
     "dispatcher_reason", "car_start_x", "car_start_y", "car_start_heading", "car_end_x", "car_end_y",
     "car_end_heading", "decoder_scores_json", "decoder_scores", "execution_start_monotonic_s",
     "execution_end_monotonic_s",
+    "source_mode", "server_url", "connection_state", "start_sequence", "end_sequence",
+    "received_samples", "expected_samples", "stream_gap_count", "invalid_frame_count",
+    "reconnect_count", "queue_overflow_count", "window_ready_monotonic_s", "collection_wait_ms",
+    "live_window_status", "live_window_failure_reason",
+    "alignment_mode_requested", "alignment_mode_used", "stimulus_flip_monotonic_s",
+    "sequence_at_flip", "trigger_request_monotonic_s", "trigger_response_monotonic_s",
+    "trigger_http_latency_ms", "trigger_sequence", "trigger_sequence_semantics",
+    "window_start_sequence", "window_end_sequence", "raw_input_unit", "raw_input_preprocessing",
 ]
 
 
@@ -75,6 +83,21 @@ def resolved_config_dict(
             "snr_db": config.synthetic_demo.snr_db if synthetic_snr_db is None else synthetic_snr_db,
             "seed": config.synthetic_demo.seed if synthetic_seed is None else synthetic_seed,
             "confirmations_required": config.synthetic_demo.confirmations_required,
+        },
+        "live": {
+            "expected_sample_rate_hz": config.live.expected_sample_rate_hz,
+            "source_channel_names": list(config.live.source_channel_names),
+            "channel_map": dict(config.live.channel_map),
+            "mapped_channel_names": list(config.acquisition.channels),
+            "trial_samples": config.live.trial_samples,
+            "max_collection_wait_s": config.live.max_collection_wait_s,
+            "alignment_mode": config.live.alignment_mode,
+            "ring_buffer_seconds": config.live.ring_buffer_seconds,
+            "trigger_url": config.live.trigger_url,
+            "trigger_timeout_s": config.live.trigger_timeout_s,
+            "queue_capacity": config.live.queue_capacity,
+            "reconnect_initial_delay_s": config.live.reconnect_initial_delay_s,
+            "reconnect_max_delay_s": config.live.reconnect_max_delay_s,
         },
         "ui": {"cjk_font_file": config.ui.cjk_font_file, "cjk_font_name": config.ui.cjk_font_name},
     }
@@ -184,6 +207,17 @@ class UnifiedSessionLogger:
             per_frequency[target_key] = (sum(bool(row["correct"]) for row in target_rows) / len(target_rows)) if target_rows else None
         confidences = _finite_values(row.get("confidence") for row in decoded)
         latencies = _finite_values(row.get("decoder_latency_ms", row.get("decoding_latency_ms")) for row in decoded)
+        live_alignment_fields = (
+            "trial_id", "attempt_id", "alignment_mode_requested", "alignment_mode_used",
+            "stimulus_flip_monotonic_s", "sequence_at_flip", "trigger_request_monotonic_s",
+            "trigger_response_monotonic_s", "trigger_http_latency_ms", "trigger_sequence",
+            "trigger_sequence_semantics", "window_start_sequence", "window_end_sequence",
+            "raw_input_unit", "raw_input_preprocessing",
+        )
+        live_alignment_trials = [
+            {field: row.get(field) for field in live_alignment_fields}
+            for row in self.rows if row.get("source_mode") == "live"
+        ]
         return {
             **self.metadata,
             "source_replay_file": self.metadata.get("source_replay_file"),
@@ -204,6 +238,13 @@ class UnifiedSessionLogger:
             "decoder_latency_ms_p50": float(np.percentile(latencies, 50)) if latencies else None,
             "decoder_latency_ms_p95": float(np.percentile(latencies, 95)) if latencies else None,
             "total_dropped_frames": int(sum(int(row.get("dropped_frames", row.get("dropped_frame_count", 0)) or 0) for row in self.rows)),
+            "alignment_mode_requested": (
+                self.effective_config.get("live", {}).get("alignment_mode")
+                if self.metadata.get("mode") == "live" else None
+            ),
+            "raw_input_unit": "uV" if self.metadata.get("mode") == "live" else None,
+            "raw_input_preprocessing": "none" if self.metadata.get("mode") == "live" else None,
+            "live_alignment_trials": live_alignment_trials,
             "final_car_state": dict(final_car_state) if final_car_state is not None else None,
             "error_type": type(error).__name__ if error else None,
             "error_message": str(error)[:500] if error else None,
