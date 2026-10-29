@@ -67,10 +67,8 @@ class LiveConfig:
     """Strict SSVEP-only live stream and trial collection contract."""
 
     expected_sample_rate_hz: float = 250.0
-    source_channel_names: tuple[str, ...] = tuple(f"CH{index}" for index in range(1, 9))
-    channel_map: dict[str, str] = field(
-        default_factory=lambda: dict(zip((f"CH{index}" for index in range(1, 9)), CANONICAL_CHANNELS))
-    )
+    source_channel_names: tuple[str, ...] = CANONICAL_CHANNELS
+    channel_map: dict[str, str] = field(default_factory=lambda: {name: name for name in CANONICAL_CHANNELS})
     trial_samples: int = 1000
     max_collection_wait_s: float = 1.0
     alignment_mode: str = "buffer_sequence"
@@ -312,7 +310,7 @@ def load_config(path: str | Path) -> DemoConfig:
     if live_rate != 250.0:
         raise ConfigurationError("live.expected_sample_rate_hz must be exactly 250")
     live_source_names = _optional(
-        live_data, "source_channel_names", [f"CH{index}" for index in range(1, 9)]
+        live_data, "source_channel_names", list(CANONICAL_CHANNELS)
     )
     if (
         not isinstance(live_source_names, list)
@@ -322,7 +320,7 @@ def load_config(path: str | Path) -> DemoConfig:
     ):
         raise ConfigurationError("live.source_channel_names must contain exactly 8 unique non-empty names")
     live_map_data = _mapping(
-        _optional(live_data, "channel_map", dict(zip(live_source_names, CANONICAL_CHANNELS))),
+        _optional(live_data, "channel_map", {name: name for name in CANONICAL_CHANNELS}),
         "live.channel_map",
     )
     live_channel_map = dict(live_map_data)

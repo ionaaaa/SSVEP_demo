@@ -29,8 +29,10 @@ from ssvep_demo.protocol import CANONICAL_CHANNELS, DecodeResult
 
 
 CONFIG_PATH = Path(__file__).parents[1] / "config" / "ssvep_demo.yaml"
+LEGACY_CONFIG_PATH = CONFIG_PATH.with_name("ssvep_demo_legacy_ch.yaml")
 CONFIG = load_config(CONFIG_PATH)
-SOURCE_NAMES = tuple(f"CH{index}" for index in range(1, 9))
+SOURCE_NAMES = CANONICAL_CHANNELS
+LEGACY_SOURCE_NAMES = tuple(f"CH{index}" for index in range(1, 9))
 
 
 def _payload(
@@ -63,19 +65,19 @@ def _payload(
     )
 
 
-def _ready_source(*, queue_capacity=None, alignment_mode="buffer_sequence", trigger_http_post=None):
+def _ready_source(*, config=CONFIG, queue_capacity=None, alignment_mode="buffer_sequence", trigger_http_post=None):
     updates = {"alignment_mode": alignment_mode}
     if queue_capacity is not None:
         updates["queue_capacity"] = queue_capacity
     if alignment_mode == "trigger":
         updates["trigger_url"] = "http://127.0.0.1:1/v1/trigger"
-    live_config = replace(CONFIG.live, **updates)
+    live_config = replace(config.live, **updates)
     source = OmniBCIWebSocketSource(
         "ws://127.0.0.1:1/v1/stream", live_config, trigger_http_post=trigger_http_post
     )
     source._started = True
     source._connection_state = "connected"
-    metadata = LiveStreamMetadata(250.0, SOURCE_NAMES, CANONICAL_CHANNELS)
+    metadata = LiveStreamMetadata(250.0, live_config.source_channel_names, CANONICAL_CHANNELS)
     source._handle_event(_WorkerEvent("metadata", 0.0, metadata=metadata))
     return source
 
@@ -98,7 +100,7 @@ def _begin(source, start_sequence, *, trial_id=0, attempt_id=0, started_s=0.0, m
     )
 
 
-def test_actual_batch_message_parses_frames_and_maps_ch1_through_ch8() -> None:
+def test_actual_batch_message_parses_direct_occipital_identity_map() -> None:
     parsed = parse_omnibci_message(
         _payload([7], value_factory=lambda _sequence, channel: channel + 0.25),
         CONFIG.live,
@@ -111,17 +113,38 @@ def test_actual_batch_message_parses_frames_and_maps_ch1_through_ch8() -> None:
     assert frame.values_uv.shape == (8,) and not frame.values_uv.flags.writeable
 
 
+def test_legacy_ch_profile_explicitly_maps_to_canonical_order() -> None:
+    legacy = load_config(LEGACY_CONFIG_PATH)
+    assert legacy.live.source_channel_names == LEGACY_SOURCE_NAMES
+    assert legacy.live.channel_map == dict(zip(LEGACY_SOURCE_NAMES, CANONICAL_CHANNELS))
+    with pytest.raises(LiveProtocolError, match="configured WebSocket source order") as error:
+        parse_omnibci_message(_payload([0], channel_names=LEGACY_SOURCE_NAMES), CONFIG.live)
+    assert error.value.code == "metadata_mismatch"
+
+    source = _ready_source(config=legacy)
+    _begin(source, 0)
+    _feed(source, _payload(range(1000), channel_names=LEGACY_SOURCE_NAMES))
+    window = source.try_take_completed_window()
+    assert window is not None
+    assert window.data.shape == (8, 1000)
+    assert window.channel_names == list(CANONICAL_CHANNELS)
+    assert window.data[0, 0] == 0 and window.data[7, 999] == 9997
+
+
 @pytest.mark.parametrize(
     ("message", "error"),
     [
         (_payload([1], sample_rate=500), "sample_rate_hz"),
         (_payload([1], channel_names=SOURCE_NAMES[:-1]), "8 channels"),
-        (_payload([1], channel_names=tuple(reversed(SOURCE_NAMES))), "physical source order"),
+        (_payload([1], channel_names=tuple(reversed(SOURCE_NAMES))), "configured WebSocket source order"),
+        (_payload([1], channel_names=SOURCE_NAMES[:-1] + ("Pz",)), "configured WebSocket source order"),
+        (_payload([1], channel_names=SOURCE_NAMES[:-1] + ("Oz",)), "duplicates found"),
     ],
 )
 def test_parser_rejects_rate_channel_count_and_order(message, error) -> None:
-    with pytest.raises(LiveProtocolError, match=error):
+    with pytest.raises(LiveProtocolError, match=error) as failure:
         parse_omnibci_message(message, CONFIG.live)
+    assert failure.value.code == "metadata_mismatch"
 
 
 def test_parser_rejects_conflicting_explicit_unit() -> None:
@@ -181,7 +204,9 @@ def test_config_rejects_invalid_live_mapping_and_contract(tmp_path: Path) -> Non
     cases = [
         (lambda value: value["live"].update(expected_sample_rate_hz=500), "exactly 250"),
         (lambda value: value["live"].update(trial_samples=999), "exactly 1000"),
-        (lambda value: value["live"]["channel_map"].update(CH8="Oz"), "map once each"),
+        (lambda value: value["live"]["channel_map"].update(O2="Oz"), "map once each"),
+        (lambda value: value["live"].update(source_channel_names=list(LEGACY_SOURCE_NAMES)), "keys must exactly match"),
+        (lambda value: value["live"].update(source_channel_names=list(SOURCE_NAMES[:-1]) + ["Oz"]), "8 unique"),
         (lambda value: value["live"].update(alignment_mode="arrival_time"), "alignment_mode"),
         (lambda value: value["live"].update(alignment_mode="trigger", trigger_url=None), "trigger_url"),
     ]
@@ -192,6 +217,25 @@ def test_config_rejects_invalid_live_mapping_and_contract(tmp_path: Path) -> Non
         path.write_text(yaml.safe_dump(value), encoding="utf-8")
         with pytest.raises(ValueError, match=expected):
             load_config(path)
+
+
+def test_legacy_source_names_without_explicit_map_are_rejected(tmp_path: Path) -> None:
+    value = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    value["live"]["source_channel_names"] = list(LEGACY_SOURCE_NAMES)
+    del value["live"]["channel_map"]
+    path = tmp_path / "implicit_legacy.yaml"
+    path.write_text(yaml.safe_dump(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="keys must exactly match"):
+        load_config(path)
+
+
+def test_fake_websocket_server_defaults_to_direct_occipital_names() -> None:
+    from scripts.fake_omnibci_ws import _message
+
+    direct_message, _ = _message(0, 1, "continuous")
+    legacy_message, _ = _message(0, 1, "continuous", LEGACY_SOURCE_NAMES)
+    assert json.loads(direct_message)["channel_names"] == list(CANONICAL_CHANNELS)
+    assert json.loads(legacy_message)["channel_names"] == list(LEGACY_SOURCE_NAMES)
 
 
 def test_exactly_1000_consecutive_frames_form_channel_major_window() -> None:
@@ -267,8 +311,16 @@ def test_disconnect_reconnect_and_queue_overflow_abort_current_trial() -> None:
 def test_protocol_error_and_metadata_change_abort_current_trial() -> None:
     source = _ready_source()
     _begin(source, 1)
-    source._handle_event(_WorkerEvent("protocol_error", 1.0, reason="protocol_error", detail="bad JSON"))
-    assert source.status().trial_failure_reason == "protocol_error"
+    with pytest.raises(LiveProtocolError) as mismatch:
+        parse_omnibci_message(_payload([1], channel_names=LEGACY_SOURCE_NAMES), CONFIG.live)
+    source._handle_event(_WorkerEvent(
+        "protocol_error", 1.0, reason=mismatch.value.code, detail=str(mismatch.value),
+    ))
+    assert source.status().trial_failure_reason == "metadata_mismatch"
+    assert any(
+        event.reason == "metadata_mismatch" and "configured WebSocket source order" in (event.detail or "")
+        for event in source.take_events()
+    )
 
     source._connection_state = "connected"
     _begin(source, 1, attempt_id=1, started_s=1.1)
@@ -421,6 +473,7 @@ class _CountingDecoder:
     def decode(self, window):
         self.calls += 1
         assert not hasattr(window, "target_frequency_hz")
+        assert window.channel_names == list(CANONICAL_CHANNELS)
         return DecodeResult(8.0, CONFIG.commands[8.0], {8.0: 1.0, 10.0: 0.0}, 0.9, time.monotonic())
 
 
@@ -443,6 +496,8 @@ def test_decoder_receives_only_complete_unlabeled_window_once() -> None:
     coordinator = LiveTrialCoordinator(decoder, dispatcher)
     window = source.try_take_completed_window()
     assert window is not None
+    assert window.data.shape == (8, 1000)
+    assert window.channel_names == list(CANONICAL_CHANNELS)
     coordinator.process(window)
     assert decoder.calls == dispatcher.calls == 1
 
@@ -468,7 +523,10 @@ def test_live_window_archive_preserves_sequences_and_replays(tmp_path: Path) -> 
     )
     replay = ReplayEEGSource(writer.path)
     assert np.array_equal(replay.window(0).data, window.data)
+    assert replay.window(0).channel_names == list(CANONICAL_CHANNELS)
     with np.load(writer.path, allow_pickle=False) as archive:
+        assert archive["data"].shape == (1, 8, 1000)
+        assert archive["channel_names"].tolist() == list(CANONICAL_CHANNELS)
         assert archive["source_mode"].tolist() == ["live"]
         assert archive["data_unit"].tolist() == ["uV"]
         assert archive["start_sequence"].tolist() == [500]

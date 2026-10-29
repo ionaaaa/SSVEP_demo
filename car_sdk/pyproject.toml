@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stm32-car-bluetooth-sdk"
+version = "0.1.0"
+description = "Direct Bluetooth SDK for the OmniBCI STM32 car"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "winrt-Windows.Devices.Bluetooth==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Devices.Bluetooth.Rfcomm==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Devices.Enumeration==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Foundation==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Foundation.Collections==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Networking==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Networking.Sockets==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams==3.2.1; sys_platform == 'win32'",
+]
+
+[tool.setuptools]
+py-modules = ["bluetooth_car"]

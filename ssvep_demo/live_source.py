@@ -198,10 +198,12 @@ def parse_omnibci_message(
     source_names = tuple(raw_names)
     if len(source_names) != 8:
         raise LiveProtocolError("metadata_mismatch", f"channel_names must contain exactly 8 channels, got {len(source_names)}")
+    if len(set(source_names)) != 8:
+        raise LiveProtocolError("metadata_mismatch", "channel_names must contain 8 unique channels; duplicates found")
     if source_names != live_config.source_channel_names:
         raise LiveProtocolError(
             "metadata_mismatch",
-            f"channel_names must match configured physical source order {live_config.source_channel_names}, got {source_names}",
+            f"channel_names must match configured WebSocket source order {live_config.source_channel_names}, got {source_names}",
         )
     if set(live_config.channel_map) != set(source_names):
         raise LiveProtocolError("metadata_mismatch", "channel_map keys do not match stream channel_names")
