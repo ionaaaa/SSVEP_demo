@@ -21,6 +21,8 @@ def test_load_demo_config() -> None:
 
     assert config.stimulus.frequencies_hz == (8.0, 10.0, 12.0, 15.0)
     assert config.acquisition.channels == CANONICAL_CHANNELS
+    assert config.live.source_channel_names == CANONICAL_CHANNELS
+    assert config.live.channel_map == {name: name for name in CANONICAL_CHANNELS}
     assert config.decoder.type == "cca"
     assert config.commands == {8.0: "LEFT", 10.0: "RIGHT", 12.0: "FORWARD", 15.0: "BACKWARD"}
     assert config.stimulus.cue_duration_s == 1.0

@@ -14,6 +14,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from ssvep_demo.protocol import CANONICAL_CHANNELS
+
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -21,10 +23,11 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--scenario", choices=["continuous", "gap", "invalid", "reconnect"], default="continuous")
     parser.add_argument("--batch-size", type=int, default=5)
+    parser.add_argument("--channel-profile", choices=["direct-occipital", "legacy-ch"], default="direct-occipital")
     return parser.parse_args()
 
 
-def _message(sequence: int, count: int, scenario: str) -> tuple[str, int]:
+def _message(sequence: int, count: int, scenario: str, channel_names: tuple[str, ...] = CANONICAL_CHANNELS) -> tuple[str, int]:
     frames = []
     for offset in range(count):
         current = sequence
@@ -49,17 +52,21 @@ def _message(sequence: int, count: int, scenario: str) -> tuple[str, int]:
         {
             "type": "eeg",
             "sample_rate_hz": 250,
-            "channel_names": [f"CH{index}" for index in range(1, 9)],
+            "channel_names": list(channel_names),
             "frames": frames,
         }
     ), sequence
 
 
-async def serve(host: str, port: int, scenario: str, batch_size: int) -> None:
+async def serve(host: str, port: int, scenario: str, batch_size: int, channel_profile: str) -> None:
     from websockets.asyncio.server import serve as websocket_serve
 
     connection_count = 0
     next_sequence = 0
+    channel_names = (
+        CANONICAL_CHANNELS if channel_profile == "direct-occipital"
+        else tuple(f"CH{index}" for index in range(1, 9))
+    )
 
     async def handler(websocket) -> None:
         nonlocal connection_count, next_sequence
@@ -67,7 +74,7 @@ async def serve(host: str, port: int, scenario: str, batch_size: int) -> None:
         sent = 0
         try:
             while True:
-                message, next_sequence = _message(next_sequence, batch_size, scenario)
+                message, next_sequence = _message(next_sequence, batch_size, scenario, channel_names)
                 await websocket.send(message)
                 sent += batch_size
                 if scenario == "reconnect" and connection_count == 1 and sent >= 250:
@@ -78,7 +85,7 @@ async def serve(host: str, port: int, scenario: str, batch_size: int) -> None:
             return
 
     async with websocket_serve(handler, host, port):
-        print(f"Fake omniBCI WebSocket: ws://{host}:{port}/v1/stream ({scenario})", flush=True)
+        print(f"Fake omniBCI WebSocket: ws://{host}:{port}/v1/stream ({scenario}, {channel_profile})", flush=True)
         await asyncio.Future()
 
 
@@ -89,11 +96,10 @@ def main() -> None:
     if args.batch_size <= 0:
         raise SystemExit("--batch-size must be positive")
     try:
-        asyncio.run(serve(args.host, args.port, args.scenario, args.batch_size))
+        asyncio.run(serve(args.host, args.port, args.scenario, args.batch_size, args.channel_profile))
     except KeyboardInterrupt:
         pass
 
 
 if __name__ == "__main__":
     main()
-

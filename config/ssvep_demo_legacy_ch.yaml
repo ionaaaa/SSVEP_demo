@@ -1,0 +1,77 @@
+stimulus:
+  frequencies: [8, 10, 12, 15]
+  trial_duration_s: 4.0
+  rest_duration_s: 2.0
+  cue_duration_s: 1.0
+  repetitions: 5
+  trial_order: fixed
+  random_seed: 42
+
+  fullscreen: false
+  window_size: [1200, 800]
+  screen_index: 0
+
+  background_color: [-1, -1, -1]
+  stimulus_on_color: [1, 1, 1]
+  stimulus_off_color: [-0.6, -0.6, -0.6]
+  dropped_frame_threshold_ratio: 1.5
+
+acquisition:
+  sample_rate_hz: 250
+  channels: [PO7, PO3, POz, PO4, PO8, O1, Oz, O2]
+
+decoder:
+  type: cca
+  harmonics: 3
+  bandpass_hz: [6, 45]
+
+commands:
+  "8": LEFT
+  "10": RIGHT
+  "12": FORWARD
+  "15": BACKWARD
+
+control:
+  confidence_threshold: 0.60
+  confirmations_required: 2
+  max_confirmation_gap_s: 1.0
+  command_duration_s: 0.5
+  input_timeout_s: 1.0
+  max_prediction_age_s: 0.5
+
+synthetic_demo:
+  snr_db: 0.0
+  seed: 42
+  confirmations_required: 1
+
+# Legacy transport labels. Select this file explicitly for CH1..CH8 streams.
+# acquisition.channels above remains the decoder/archive target order.
+live:
+  expected_sample_rate_hz: 250
+  source_channel_names: [CH1, CH2, CH3, CH4, CH5, CH6, CH7, CH8]
+  channel_map:
+    CH1: PO7
+    CH2: PO3
+    CH3: POz
+    CH4: PO4
+    CH5: PO8
+    CH6: O1
+    CH7: Oz
+    CH8: O2
+  trial_samples: 1000
+  max_collection_wait_s: 1.0
+  # buffer_sequence is software-side receive-buffer alignment only; trigger
+  # uses omniBCI-R's event-aligned device sequence. Neither proves photon onset.
+  alignment_mode: buffer_sequence
+  ring_buffer_seconds: 20.0
+  trigger_url: null
+  trigger_timeout_s: 0.5
+  queue_capacity: 4096
+  reconnect_initial_delay_s: 0.1
+  reconnect_max_delay_s: 5.0
+
+ui:
+  # Null selects the bundled Noto Sans CJK SC font. A relative override path
+  # is resolved relative to this YAML file, never the process working directory.
+  cjk_font_file: null
+  cjk_font_name: null

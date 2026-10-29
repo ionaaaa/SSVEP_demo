@@ -26,6 +26,8 @@ ENV/
 outputs/
 results/
 
+BT04-A蓝牙模块资料/
+
 # Editor and operating-system metadata
 .idea/
 .vscode/

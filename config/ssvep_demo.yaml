@@ -44,20 +44,20 @@ synthetic_demo:
   seed: 42
   confirmations_required: 1
 
-# Physical lead/cap wiring for the omniBCI stream. CH1..CH8 are transport
-# labels only; this explicit map assigns their SSVEP electrode semantics.
+# Direct occipital channel names from the omniBCI-R SSVEP profile. The
+# acquisition.channels list above is the decoder/archive target order.
 live:
   expected_sample_rate_hz: 250
-  source_channel_names: [CH1, CH2, CH3, CH4, CH5, CH6, CH7, CH8]
+  source_channel_names: [PO7, PO3, POz, PO4, PO8, O1, Oz, O2]
   channel_map:
-    CH1: PO7
-    CH2: PO3
-    CH3: POz
-    CH4: PO4
-    CH5: PO8
-    CH6: O1
-    CH7: Oz
-    CH8: O2
+    PO7: PO7
+    PO3: PO3
+    POz: POz
+    PO4: PO4
+    PO8: PO8
+    O1: O1
+    Oz: Oz
+    O2: O2
   trial_samples: 1000
   max_collection_wait_s: 1.0
   # buffer_sequence is software-side receive-buffer alignment only; trigger
