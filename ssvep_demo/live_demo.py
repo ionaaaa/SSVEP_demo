@@ -8,10 +8,16 @@ import json
 import math
 from pathlib import Path
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
-from .config import DemoConfig
+from .config import ControllerConfig, DemoConfig
 from .control import DispatchDecision, SafeCommandDispatcher
+from .controller_factory import (
+    ControllerRuntime,
+    cleanup_controller,
+    create_controller,
+    log_controller_connected,
+)
 from .decoders import CCADecoder, FFTDecoder, SSVEPDecoder
 from .eeg_archive import EEGWindowArchiveWriter
 from .live_source import LiveEEGSource, LiveSourceStatus, OmniBCIWebSocketSource
@@ -32,7 +38,6 @@ from .stimulus import (
     static_target_states,
     target_layout,
 )
-from .virtual_car import VirtualCarController
 
 
 class LiveDemoState(str, Enum):
@@ -184,7 +189,7 @@ class _LiveDemoView:
         state: LiveDemoState,
         trial: ScheduledTrial | None,
         target_states: dict[float, bool],
-        car: VirtualCarController,
+        controller: ControllerRuntime,
         result: DecodeResult | None,
         decision: DispatchDecision | None,
         trial_total: int,
@@ -220,16 +225,25 @@ class _LiveDemoView:
         dispatch = "--" if decision is None else f"{decision.action}: {decision.reason}"
         self.results.text = f"Decoder results\n{scores}\n\nPrediction: {prediction}\nDispatch: {dispatch}"
         self.results.draw()
-        car_x, car_y = (0.48 + car.x * 0.35, -0.02 + car.y * 0.38)
-        angle = math.radians(car.heading_degrees)
-        self.car_rect.pos = (car_x, car_y)
-        self.heading.start = (car_x, car_y)
-        self.heading.end = (car_x + 0.11 * math.cos(angle), car_y + 0.11 * math.sin(angle))
-        self.car_rect.draw()
-        self.heading.draw()
-        active = car.active_command.value if car.active_command else "STOPPED"
+        car = controller.virtual_car
         suffix = "" if remaining_s is None else f" / {remaining_s:.2f}s"
-        self.car_text.text = f"Virtual car\n({car.x:.2f}, {car.y:.2f})  {car.heading_degrees:.0f}°\n{active}{suffix}"
+        if car is not None:
+            car_x, car_y = (0.48 + car.x * 0.35, -0.02 + car.y * 0.38)
+            angle = math.radians(car.heading_degrees)
+            self.car_rect.pos = (car_x, car_y)
+            self.heading.start = (car_x, car_y)
+            self.heading.end = (car_x + 0.11 * math.cos(angle), car_y + 0.11 * math.sin(angle))
+            self.car_rect.draw()
+            self.heading.draw()
+            active = car.active_command.value if car.active_command else "STOPPED"
+            self.car_text.text = f"Controller: Virtual\n({car.x:.2f}, {car.y:.2f})  {car.heading_degrees:.0f}°\n{active}{suffix}"
+        else:
+            requested = "--" if decision is None else decision.effective_command.value
+            fault = "" if controller.last_error is None else f"\nFault: {controller.last_error}"
+            self.car_text.text = (
+                f"Controller: Bluetooth\nCar device: {controller.device_name or controller.device_id}\n"
+                f"Car state: {controller.state}\nLast requested: {requested}{suffix}{fault}"
+            )
         self.car_text.draw()
 
 
@@ -247,6 +261,7 @@ class SSVEPLiveDemoRunner:
         max_trials: int | None = None,
         confirmations_required: int | None = None,
         live_source: LiveEEGSource | None = None,
+        controller_runtime_factory: Callable[[], ControllerRuntime] | None = None,
     ) -> None:
         if config.stimulus.trial_duration_s != 4.0:
             raise ValueError("live mode requires stimulus.trial_duration_s to be exactly 4.0")
@@ -279,9 +294,15 @@ class SSVEPLiveDemoRunner:
         self.live_source = live_source or OmniBCIWebSocketSource(server_url, config.live)
         self._attempts: dict[int, int] = {}
         self._drop_total = 0
+        self._controller_runtime_factory = controller_runtime_factory
 
     def _decoder(self) -> SSVEPDecoder:
         return FFTDecoder(self.config) if self.decoder_type == "fft" else CCADecoder(self.config)
+
+    def _create_controller_runtime(self) -> ControllerRuntime:
+        if self._controller_runtime_factory is not None:
+            return self._controller_runtime_factory()
+        return create_controller(self.config.controller, mode="live")
 
     def run(self) -> Path:
         try:
@@ -289,18 +310,22 @@ class SSVEPLiveDemoRunner:
             from psychopy import event, visual
         except ImportError as exc:  # pragma: no cover - GUI dependency
             raise RuntimeError("PsychoPy is required for live mode. Install the 'stimulus' extra.") from exc
-        win = visual.Window(
-            size=self.config.stimulus.window_size,
-            fullscr=self.fullscreen,
-            screen=self.config.stimulus.screen_index,
-            color=self.config.stimulus.background_color,
-            units="norm",
-            waitBlanking=True,
-        )
+        controller_runtime = self._create_controller_runtime()
+        try:
+            win = visual.Window(
+                size=self.config.stimulus.window_size,
+                fullscr=self.fullscreen,
+                screen=self.config.stimulus.screen_index,
+                color=self.config.stimulus.background_color,
+                units="norm",
+                waitBlanking=True,
+            )
+        except BaseException:
+            cleanup_controller(None, controller_runtime)
+            raise
         logger: UnifiedSessionLogger | None = None
         archive: EEGWindowArchiveWriter | None = None
         dispatcher: SafeCommandDispatcher | None = None
-        car = VirtualCarController()
         error: BaseException | None = None
         try:
             font = resolve_cjk_font(
@@ -340,18 +365,20 @@ class SSVEPLiveDemoRunner:
                     "human_ssvep_validated": False,
                     "hardware_sync_validated": False,
                     "real_car_validated": False,
+                    **controller_runtime.metadata(),
                 },
             )
+            log_controller_connected(logger, controller_runtime)
             archive = EEGWindowArchiveWriter(
                 logger.directory / "eeg_windows.npz", self.config.acquisition.channels, self.config.live.trial_samples
             )
-            dispatcher = SafeCommandDispatcher(car, self.control_config, self.config.commands)
+            dispatcher = SafeCommandDispatcher(controller_runtime.controller, self.control_config, self.config.commands)
             coordinator = LiveTrialCoordinator(self._decoder(), dispatcher)
             view = _LiveDemoView(win, visual, self.config, font, estimates)
             self.live_source.start()
             logger.event("live_source_started", server_url=self.server_url)
             self._run_loop(
-                win, event, view, logger, archive, coordinator, dispatcher, car, refresh_hz, nominal_interval_s
+                win, event, view, logger, archive, coordinator, dispatcher, controller_runtime, refresh_hz, nominal_interval_s
             )
             logger.event("session_finished" if self.state_machine.state is LiveDemoState.FINISHED else "session_stopped")
             return logger.directory
@@ -361,23 +388,33 @@ class SSVEPLiveDemoRunner:
                 logger.event("session_failed", error_type=type(exc).__name__, error_message=str(exc)[:500])
             raise
         finally:
+            cleanup_error: BaseException | None = None
             try:
                 self.live_source.abort_trial("runner_shutdown")
-            finally:
+            except BaseException as exc:
+                cleanup_error = exc
+            controller_error = cleanup_controller(dispatcher, controller_runtime, logger)
+            cleanup_error = cleanup_error or controller_error
+            try:
+                self.live_source.close()
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+            if logger is not None:
                 try:
-                    if dispatcher is not None:
-                        dispatcher.close()
-                finally:
-                    car.stop()
-                    self.live_source.close()
-                    if logger is not None:
-                        logger.close(
-                            status="failed" if error else self.state_machine.state.value.lower(),
-                            archived_eeg_windows=archive.count if archive is not None else 0,
-                            final_car_state=car.state(),
-                            error=error,
-                        )
-                    win.close()
+                    logger.close(
+                        status="failed" if error or cleanup_error else self.state_machine.state.value.lower(),
+                        archived_eeg_windows=archive.count if archive is not None else 0,
+                        final_car_state=controller_runtime.snapshot(),
+                        error=error or cleanup_error,
+                    )
+                except BaseException as exc:
+                    cleanup_error = cleanup_error or exc
+            try:
+                win.close()
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+            if error is None and cleanup_error is not None:
+                raise cleanup_error
 
     def _run_loop(
         self,
@@ -388,10 +425,14 @@ class SSVEPLiveDemoRunner:
         archive: EEGWindowArchiveWriter,
         coordinator: LiveTrialCoordinator,
         dispatcher: SafeCommandDispatcher,
-        car: VirtualCarController,
+        controller: ControllerRuntime,
         refresh_hz: float,
         nominal_interval_s: float,
     ) -> None:
+        # Preserve the pre-integration internal test/injection contract while
+        # normal runners always pass the centralized runtime wrapper.
+        if not isinstance(controller, ControllerRuntime):
+            controller = ControllerRuntime(controller, ControllerConfig(), virtual_car=controller)
         cue_start_s: float | None = None
         rest_start_s: float | None = None
         marker: FlipMarkerRecorder | None = None
@@ -403,6 +444,11 @@ class SSVEPLiveDemoRunner:
         previous_frame_s = time.monotonic()
 
         while self.state_machine.state not in {LiveDemoState.FINISHED, LiveDemoState.STOPPED}:
+            try:
+                controller.ensure_healthy()
+            except BaseException as exc:
+                logger.event("controller_fault", controller_state=controller.state, error_message=str(exc)[:500])
+                raise
             self.live_source.poll()
             for source_event in self.live_source.take_events():
                 exact_event_names = {
@@ -440,9 +486,9 @@ class SSVEPLiveDemoRunner:
             if "escape" in keys:
                 self.live_source.abort_trial("escape")
                 dispatcher.stop(now_s, reason="escape")
-                car.stop()
+                controller.stop_virtual()
                 if record is not None:
-                    self._finish_record(record, car, self.live_source.status(), "stopped")
+                    self._finish_record(record, controller, self.live_source.status(), "stopped")
                     logger.trial(record)
                     record = None
                 self.state_machine.stop()
@@ -459,9 +505,9 @@ class SSVEPLiveDemoRunner:
                     was_rest = self.state_machine.state is LiveDemoState.REST
                     self.live_source.abort_trial("paused")
                     dispatcher.stop(now_s, reason="paused")
-                    car.stop()
+                    controller.stop_virtual()
                     if not was_rest and record is not None:
-                        self._finish_record(record, car, self.live_source.status(), "aborted", "paused")
+                        self._finish_record(record, controller, self.live_source.status(), "aborted", "paused")
                         logger.trial(record)
                         record = None
                     self.state_machine.pause()
@@ -471,10 +517,10 @@ class SSVEPLiveDemoRunner:
             state = self.state_machine.state
             trial = self.state_machine.current_trial if state is not LiveDemoState.IDLE else None
             if state is LiveDemoState.IDLE:
-                car.stop()
+                controller.stop_virtual()
                 view.draw(
                     state=state, trial=None, target_states=static_target_states(self.config.stimulus.frequencies_hz),
-                    car=car, result=None, decision=None, trial_total=len(self.schedule),
+                    controller=controller, result=None, decision=None, trial_total=len(self.schedule),
                     dropped_frames=self._drop_total, live=live_status,
                 )
                 win.flip()
@@ -483,10 +529,10 @@ class SSVEPLiveDemoRunner:
                     logger.event("session_started")
                 continue
             if state is LiveDemoState.PAUSED:
-                car.stop()
+                controller.stop_virtual()
                 view.draw(
                     state=state, trial=self.state_machine.current_trial,
-                    target_states=static_target_states(self.config.stimulus.frequencies_hz), car=car,
+                    target_states=static_target_states(self.config.stimulus.frequencies_hz), controller=controller,
                     result=None, decision=None, trial_total=len(self.schedule), dropped_frames=self._drop_total,
                     live=live_status,
                 )
@@ -494,7 +540,7 @@ class SSVEPLiveDemoRunner:
                 continue
             assert trial is not None
             if state is LiveDemoState.CUE:
-                car.stop()
+                controller.stop_virtual()
                 if cue_start_s is None:
                     cue_start_s = now_s
                     record = self._new_record(trial)
@@ -502,7 +548,7 @@ class SSVEPLiveDemoRunner:
                     logger.event("cue_started", trial_id=trial.trial_id, attempt_id=record["attempt_id"])
                 view.draw(
                     state=state, trial=trial, target_states=static_target_states(self.config.stimulus.frequencies_hz),
-                    car=car, result=None, decision=None, trial_total=len(self.schedule),
+                    controller=controller, result=None, decision=None, trial_total=len(self.schedule),
                     dropped_frames=self._drop_total, live=live_status,
                 )
                 win.flip()
@@ -511,7 +557,7 @@ class SSVEPLiveDemoRunner:
                     marker = scheduler = None
                 continue
             if state is LiveDemoState.STIMULATING:
-                car.stop()
+                controller.stop_virtual()
                 if marker is None:
                     marker = FlipMarkerRecorder()
                     scheduler = FlickerScheduler(self.config.stimulus.frequencies_hz, refresh_hz)
@@ -520,7 +566,7 @@ class SSVEPLiveDemoRunner:
                     logger.event("stimulation_started", trial_id=trial.trial_id, attempt_id=record["attempt_id"])
                 assert scheduler is not None and record is not None
                 view.draw(
-                    state=state, trial=trial, target_states=scheduler.advance(), car=car, result=None, decision=None,
+                    state=state, trial=trial, target_states=scheduler.advance(), controller=controller, result=None, decision=None,
                     trial_total=len(self.schedule), dropped_frames=self._drop_total, live=live_status,
                 )
                 if marker.stimulus_start_monotonic_s is None:
@@ -543,7 +589,7 @@ class SSVEPLiveDemoRunner:
                     self.state_machine.stimulation_complete()
                     view.draw(
                         state=LiveDemoState.COLLECTING_LIVE_WINDOW, trial=trial,
-                        target_states=static_target_states(self.config.stimulus.frequencies_hz), car=car,
+                        target_states=static_target_states(self.config.stimulus.frequencies_hz), controller=controller,
                         result=None, decision=None, trial_total=len(self.schedule), dropped_frames=self._drop_total,
                         live=self.live_source.status(),
                     )
@@ -590,15 +636,15 @@ class SSVEPLiveDemoRunner:
                     failure = "collection_timeout"
                 view.draw(
                     state=state, trial=trial, target_states=static_target_states(self.config.stimulus.frequencies_hz),
-                    car=car, result=None, decision=None, trial_total=len(self.schedule), dropped_frames=self._drop_total,
+                    controller=controller, result=None, decision=None, trial_total=len(self.schedule), dropped_frames=self._drop_total,
                     live=status,
                 )
                 win.flip()
                 if failure is not None:
                     dispatcher.stop(now_s, reason=failure)
-                    car.stop()
+                    controller.stop_virtual()
                     self._apply_live_fields(record, status, "incomplete_live_window", failure)
-                    self._finish_record(record, car, status, "aborted", failure)
+                    self._finish_record(record, controller, status, "aborted", failure)
                     self.state_machine.collection_failed()
                     rest_start_s = None
                     logger.event("live_window_failed", trial_id=trial.trial_id, attempt_id=record["attempt_id"], reason=failure)
@@ -606,9 +652,21 @@ class SSVEPLiveDemoRunner:
             if state is LiveDemoState.DECODING:
                 assert record is not None
                 window = record.pop("_window")
-                car_start = car.state()
+                car_start = controller.position()
                 logger.event("decode_started", trial_id=trial.trial_id, attempt_id=record["attempt_id"])
-                computation = coordinator.process(window)
+                try:
+                    computation = coordinator.process(window)
+                except BaseException as exc:
+                    try:
+                        controller.ensure_healthy()
+                    except BaseException as fault:
+                        logger.event(
+                            "controller_fault",
+                            controller_state=controller.state,
+                            error_message=str(fault)[:500],
+                        )
+                        raise fault from exc
+                    raise
                 result, decision = computation.result, computation.decision
                 record.update(
                     decoder_type=self.decoder_type,
@@ -642,7 +700,7 @@ class SSVEPLiveDemoRunner:
                 if deadline is not None:
                     execution_start = float(record.get("execution_start_monotonic_s", now_s))
                     allowed_delta_s = max(0.0, min(now_s, deadline) - max(frame_start_s, execution_start))
-                car.update(allowed_delta_s)
+                controller.update_virtual(allowed_delta_s)
                 timeout = dispatcher.tick(now_s)
                 if timeout is not None:
                     decision = timeout
@@ -654,19 +712,19 @@ class SSVEPLiveDemoRunner:
                 remaining = None if deadline is None else max(0.0, deadline - now_s)
                 view.draw(
                     state=state, trial=trial, target_states=static_target_states(self.config.stimulus.frequencies_hz),
-                    car=car, result=result, decision=decision, trial_total=len(self.schedule),
+                    controller=controller, result=result, decision=decision, trial_total=len(self.schedule),
                     dropped_frames=self._drop_total, live=self.live_source.status(), remaining_s=remaining,
                 )
                 win.flip()
-                if execution_rendered and (timeout is not None or not car.is_moving):
-                    car.stop()
+                if execution_rendered and (timeout is not None or not controller.motion_active(dispatcher)):
+                    controller.stop_virtual()
                     record.setdefault("execution_end_monotonic_s", time.monotonic())
                     self.state_machine.executing_complete()
                     rest_start_s = None
                 execution_rendered = True
                 continue
             if state is LiveDemoState.REST:
-                car.stop()
+                controller.stop_virtual()
                 if rest_start_s is None:
                     rest_start_s = now_s
                     logger.event("rest_started", trial_id=trial.trial_id, attempt_id=record["attempt_id"] if record else None)
@@ -674,14 +732,14 @@ class SSVEPLiveDemoRunner:
                 decision = computation.decision if computation else None
                 view.draw(
                     state=state, trial=trial, target_states=static_target_states(self.config.stimulus.frequencies_hz),
-                    car=car, result=result, decision=decision, trial_total=len(self.schedule),
+                    controller=controller, result=result, decision=decision, trial_total=len(self.schedule),
                     dropped_frames=self._drop_total, live=self.live_source.status(),
                 )
                 win.flip()
                 if now_s - rest_start_s >= self.config.stimulus.rest_duration_s:
                     assert record is not None
                     if record.get("trial_status") != "aborted":
-                        self._finish_record(record, car, self.live_source.status(), "completed")
+                        self._finish_record(record, controller, self.live_source.status(), "completed")
                     logger.trial(record)
                     logger.event("trial_completed", trial_id=trial.trial_id, attempt_id=record["attempt_id"], status=record["trial_status"])
                     record = None
@@ -747,7 +805,7 @@ class SSVEPLiveDemoRunner:
     def _finish_record(
         self,
         record: dict[str, Any],
-        car: VirtualCarController,
+        controller: ControllerRuntime,
         status: LiveSourceStatus,
         trial_status: str,
         failure_reason: str | None = None,
@@ -755,4 +813,9 @@ class SSVEPLiveDemoRunner:
         record["trial_status"] = trial_status
         if failure_reason is not None:
             self._apply_live_fields(record, status, "incomplete_live_window", failure_reason)
-        record.update(car_end_x=car.x, car_end_y=car.y, car_end_heading=car.heading_degrees)
+        position = controller.position()
+        record.update(
+            car_end_x=position["x"],
+            car_end_y=position["y"],
+            car_end_heading=position["heading_degrees"],
+        )

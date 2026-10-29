@@ -31,6 +31,8 @@ class ReplayDemoRunner:
         no_gui: bool = False,
         confirmations_required: int | None = None,
     ) -> None:
+        if config.controller.type == "bluetooth":
+            raise ValueError("Bluetooth controller is disabled in replay mode for safety.")
         if decoder_type is not None and decoder_type not in {"fft", "cca"}:
             raise ValueError("decoder_type must be 'fft' or 'cca'")
         if max_trials is not None and (not isinstance(max_trials, int) or isinstance(max_trials, bool) or max_trials <= 0):

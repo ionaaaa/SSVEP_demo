@@ -79,6 +79,16 @@ def resolved_config_dict(
             "input_timeout_s": config.control.input_timeout_s,
             "max_prediction_age_s": config.control.max_prediction_age_s,
         },
+        "controller": {
+            "type": config.controller.type,
+            "bluetooth": {
+                "device_name": config.controller.bluetooth.device_name,
+                "device_id": config.controller.bluetooth.device_id,
+                "connect_timeout_s": config.controller.bluetooth.connect_timeout_s,
+                "io_timeout_s": config.controller.bluetooth.io_timeout_s,
+                "close_timeout_s": config.controller.bluetooth.close_timeout_s,
+            },
+        },
         "synthetic_demo": {
             "snr_db": config.synthetic_demo.snr_db if synthetic_snr_db is None else synthetic_snr_db,
             "seed": config.synthetic_demo.seed if synthetic_seed is None else synthetic_seed,

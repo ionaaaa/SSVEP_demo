@@ -63,6 +63,25 @@ class SyntheticDemoConfig:
 
 
 @dataclass(frozen=True)
+class BluetoothControllerConfig:
+    """Windows Bluetooth transport settings, separate from safety policy."""
+
+    device_name: str | None = "OmniBCI_Car_Kit"
+    device_id: str | None = None
+    connect_timeout_s: float = 10.0
+    io_timeout_s: float = 3.0
+    close_timeout_s: float = 3.0
+
+
+@dataclass(frozen=True)
+class ControllerConfig:
+    """Select the command destination without changing dispatcher rules."""
+
+    type: str = "virtual"
+    bluetooth: BluetoothControllerConfig = field(default_factory=BluetoothControllerConfig)
+
+
+@dataclass(frozen=True)
 class LiveConfig:
     """Strict SSVEP-only live stream and trial collection contract."""
 
@@ -90,6 +109,7 @@ class DemoConfig:
     control: ControlConfig = field(default_factory=ControlConfig)
     synthetic_demo: SyntheticDemoConfig = field(default_factory=SyntheticDemoConfig)
     live: LiveConfig = field(default_factory=LiveConfig)
+    controller: ControllerConfig = field(default_factory=ControllerConfig)
 
 
 def _mapping(value: Any, field_name: str) -> Mapping[str, Any]:
@@ -167,6 +187,8 @@ def load_config(path: str | Path) -> DemoConfig:
     control_data = _mapping(_optional(root, "control", {}), "control")
     synthetic_data = _mapping(_optional(root, "synthetic_demo", {}), "synthetic_demo")
     live_data = _mapping(_optional(root, "live", {}), "live")
+    controller_data = _mapping(_optional(root, "controller", {}), "controller")
+    bluetooth_data = _mapping(_optional(controller_data, "bluetooth", {}), "controller.bluetooth")
 
     frequencies_value = _required(stimulus_data, "frequencies", "stimulus")
     if not isinstance(frequencies_value, list) or not frequencies_value:
@@ -306,6 +328,41 @@ def load_config(path: str | Path) -> DemoConfig:
         confirmations_required=synthetic_confirmations,
     )
 
+    controller_type = _optional(controller_data, "type", "virtual")
+    if controller_type not in {"virtual", "bluetooth"}:
+        raise ConfigurationError("controller.type must be either 'virtual' or 'bluetooth'")
+    bluetooth_device_name = _optional_string(
+        _optional(bluetooth_data, "device_name", "OmniBCI_Car_Kit"), "controller.bluetooth.device_name"
+    )
+    bluetooth_device_id = _optional_string(
+        _optional(bluetooth_data, "device_id", None), "controller.bluetooth.device_id"
+    )
+    if controller_type == "bluetooth" and bluetooth_device_name is None and bluetooth_device_id is None:
+        raise ConfigurationError(
+            "controller.bluetooth requires device_id or device_name when controller.type is 'bluetooth'"
+        )
+    bluetooth_timeouts: dict[str, float] = {}
+    for timeout_name, default in (
+        ("connect_timeout_s", 10.0),
+        ("io_timeout_s", 3.0),
+        ("close_timeout_s", 3.0),
+    ):
+        value = _number(
+            _optional(bluetooth_data, timeout_name, default),
+            f"controller.bluetooth.{timeout_name}",
+        )
+        if value <= 0:
+            raise ConfigurationError(f"controller.bluetooth.{timeout_name} must be greater than zero")
+        bluetooth_timeouts[timeout_name] = value
+    controller = ControllerConfig(
+        type=controller_type,
+        bluetooth=BluetoothControllerConfig(
+            device_name=bluetooth_device_name,
+            device_id=bluetooth_device_id,
+            **bluetooth_timeouts,
+        ),
+    )
+
     live_rate = _number(_optional(live_data, "expected_sample_rate_hz", 250), "live.expected_sample_rate_hz")
     if live_rate != 250.0:
         raise ConfigurationError("live.expected_sample_rate_hz must be exactly 250")
@@ -409,4 +466,5 @@ def load_config(path: str | Path) -> DemoConfig:
         control=control,
         synthetic_demo=synthetic_demo,
         live=live,
+        controller=controller,
     )

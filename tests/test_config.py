@@ -31,6 +31,9 @@ def test_load_demo_config() -> None:
     assert config.commands[8.0] is ControlCommand.LEFT
     assert config.control.confirmations_required == 2
     assert config.synthetic_demo.confirmations_required == 1
+    assert config.controller.type == "virtual"
+    assert config.controller.bluetooth.device_name == "OmniBCI_Car_Kit"
+    assert config.controller.bluetooth.connect_timeout_s == 10.0
 
 
 def test_old_config_without_visual_fields_uses_stimulus_defaults(tmp_path: Path) -> None:
@@ -38,6 +41,7 @@ def test_old_config_without_visual_fields_uses_stimulus_defaults(tmp_path: Path)
     config.pop("ui")
     config.pop("control")
     config.pop("synthetic_demo")
+    config.pop("controller")
     for field in (
         "cue_duration_s", "trial_order", "random_seed", "fullscreen", "window_size", "screen_index",
         "background_color", "stimulus_on_color", "stimulus_off_color", "dropped_frame_threshold_ratio",
@@ -52,6 +56,32 @@ def test_old_config_without_visual_fields_uses_stimulus_defaults(tmp_path: Path)
     assert loaded.ui.cjk_font_file is None
     assert loaded.control.command_duration_s == 0.5
     assert loaded.synthetic_demo.seed == 42
+    assert loaded.controller.type == "virtual"
+
+
+def test_yaml_can_select_bluetooth_controller_and_exact_device_id(tmp_path: Path) -> None:
+    config = _base_config()
+    config["controller"] = {
+        "type": "bluetooth",
+        "bluetooth": {
+            "device_name": "paired-car",
+            "device_id": "exact-device-id",
+            "connect_timeout_s": 7.5,
+            "io_timeout_s": 2.5,
+            "close_timeout_s": 1.5,
+        },
+    }
+    path = tmp_path / "bluetooth.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(path)
+
+    assert loaded.controller.type == "bluetooth"
+    assert loaded.controller.bluetooth.device_name == "paired-car"
+    assert loaded.controller.bluetooth.device_id == "exact-device-id"
+    assert loaded.controller.bluetooth.connect_timeout_s == 7.5
+    assert loaded.controller.bluetooth.io_timeout_s == 2.5
+    assert loaded.controller.bluetooth.close_timeout_s == 1.5
 
 
 def test_load_config_accepts_optional_cjk_font_override(tmp_path: Path) -> None:
@@ -81,6 +111,15 @@ def test_load_config_accepts_optional_cjk_font_override(tmp_path: Path) -> None:
         (lambda config: config["stimulus"].update(trial_order="shuffle"), "trial_order"),
         (lambda config: config["stimulus"].update(window_size=[0, 800]), "window_size"),
         (lambda config: config["stimulus"].update(background_color=[2, 0, 0]), "between -1 and 1"),
+        (lambda config: config["controller"].update(type="serial"), "controller.type"),
+        (
+            lambda config: config["controller"]["bluetooth"].update(connect_timeout_s=0),
+            "connect_timeout_s must be greater than zero",
+        ),
+        (
+            lambda config: config["controller"]["bluetooth"].update(io_timeout_s=float("inf")),
+            "io_timeout_s must be finite",
+        ),
     ],
 )
 def test_load_config_rejects_invalid_protocol(tmp_path: Path, mutate, message: str) -> None:

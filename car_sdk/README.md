@@ -4,13 +4,13 @@
 
 ## 安装
 
-Windows 10/11、Python 3.11–3.13。在 Windows 蓝牙设置中配对 `OmniBCI_Car_Kit`，然后安装收到的 wheel 文件：
+Windows 10/11、Python 3.11–3.13。在 Windows 蓝牙设置中配对 `OmniBCI_Car_Kit`，然后可从源码目录进行 editable install：
 
 ```powershell
-python -m pip install .\stm32_car_bluetooth_sdk-0.1.0-py3-none-any.whl
+python -m pip install -e .\car_sdk
 ```
 
-wheel 会自动安装 SDK 所需的 Windows 蓝牙运行组件。
+安装会自动拉取 SDK 所需的 Windows 蓝牙运行组件；这些依赖带有 Windows 平台条件。
 
 ## 在其他 Python 程序中使用
 

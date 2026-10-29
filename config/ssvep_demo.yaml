@@ -39,6 +39,15 @@ control:
   input_timeout_s: 1.0
   max_prediction_age_s: 0.5
 
+controller:
+  type: virtual
+  bluetooth:
+    device_name: OmniBCI_Car_Kit
+    device_id: null
+    connect_timeout_s: 10.0
+    io_timeout_s: 3.0
+    close_timeout_s: 3.0
+
 synthetic_demo:
   snr_db: 0.0
   seed: 42

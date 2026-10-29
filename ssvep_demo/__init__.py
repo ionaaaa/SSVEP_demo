@@ -1,6 +1,14 @@
 """Shared configuration and data protocol for the SSVEP demonstration."""
 
-from .config import DemoConfig, LiveConfig, SyntheticDemoConfig, UIConfig, load_config
+from .config import (
+    BluetoothControllerConfig,
+    ControllerConfig,
+    DemoConfig,
+    LiveConfig,
+    SyntheticDemoConfig,
+    UIConfig,
+    load_config,
+)
 from .control import ControlCommand, ControlConfig, Controller, DispatchDecision, SafeCommandDispatcher
 from .decoders import CCADecoder, FFTDecoder, SSVEPDecoder
 from .protocol import CANONICAL_CHANNELS, DecodeResult, EEGWindow, TrialMarker
@@ -22,9 +30,11 @@ from .virtual_car import VirtualCarController
 __all__ = [
     "CCADecoder",
     "CANONICAL_CHANNELS",
+    "BluetoothControllerConfig",
     "ControlCommand",
     "ControlConfig",
     "Controller",
+    "ControllerConfig",
     "DecodeResult",
     "DispatchDecision",
     "DemoConfig",
