@@ -6,7 +6,9 @@ import csv
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Any, Mapping, Sequence
 
@@ -35,6 +37,8 @@ TRIAL_FIELDS = [
     "sequence_at_flip", "trigger_request_monotonic_s", "trigger_response_monotonic_s",
     "trigger_http_latency_ms", "trigger_sequence", "trigger_sequence_semantics",
     "window_start_sequence", "window_end_sequence", "raw_input_unit", "raw_input_preprocessing",
+    "controller_type", "controller_state_at_decision", "controller_command_requested",
+    "controller_command_delivery_status", "controller_failure_reason",
 ]
 
 
@@ -128,6 +132,15 @@ class UnifiedSessionLogger:
         self.directory.mkdir(parents=True)
         self.started_monotonic_s = time.monotonic()
         self.started_utc = datetime.now(timezone.utc)
+        self._closed = False
+        self._controller_counts = {
+            "requested": 0,
+            "queued": 0,
+            "sent": 0,
+            "failed": 0,
+            "coalesced": 0,
+            "stop_requested": 0,
+        }
         self.effective_config = dict(effective_config)
         (self.directory / "config.yaml").write_text(
             yaml.safe_dump(self.effective_config, allow_unicode=True, sort_keys=False), encoding="utf-8"
@@ -148,11 +161,16 @@ class UnifiedSessionLogger:
             "schema_version": SESSION_SCHEMA_VERSION,
             "mode": metadata.get("mode"),
             "started_utc": self.started_utc.isoformat(),
+            "session_started_utc": self.started_utc.isoformat(),
+            "session_started_monotonic_s": self.started_monotonic_s,
             "effective_config": self.effective_config,
             **dict(metadata),
         }
+        self.event("session_starting", session_status="starting")
 
     def event(self, event: str, **payload: Any) -> None:
+        if self._closed:
+            return
         record = {
             "schema_version": SESSION_SCHEMA_VERSION,
             "event": event,
@@ -162,6 +180,38 @@ class UnifiedSessionLogger:
         }
         self._events.write(json.dumps(_json_safe(record), ensure_ascii=False) + "\n")
         self._events.flush()
+
+    def controller_event(self, controller_event: Any, *, controller_type: str) -> None:
+        """Persist one immutable controller event on the logger-owning thread."""
+        event_type = str(controller_event.event_type)
+        counter = {
+            "controller_command_requested": "requested",
+            "controller_command_queued": "queued",
+            "controller_command_sent": "sent",
+            "controller_command_failed": "failed",
+            "controller_command_coalesced": "coalesced",
+            "controller_stop_requested": "stop_requested",
+        }.get(event_type)
+        if counter is not None:
+            self._controller_counts[counter] += 1
+        payload = {
+            "controller_event_sequence": int(controller_event.sequence),
+            "controller_type": controller_type,
+            "controller_state": controller_event.state,
+            "command": controller_event.command,
+            "payload_ascii": controller_event.payload_ascii,
+            "event_type": event_type,
+            "event_monotonic_s": float(controller_event.monotonic_s),
+            "success": controller_event.success,
+            "error": controller_event.error,
+        }
+        if event_type == "controller_command_sent":
+            payload["delivery_semantics"] = "SDK/host Bluetooth stack write returned successfully"
+        self.event(event_type, **payload)
+
+    def update_metadata(self, **metadata: Any) -> None:
+        if not self._closed:
+            self.metadata.update(metadata)
 
     def trial(self, record: Mapping[str, Any]) -> None:
         normalised = {field: _csv_value(record.get(field)) for field in TRIAL_FIELDS}
@@ -187,21 +237,63 @@ class UnifiedSessionLogger:
         archived_eeg_windows: int,
         final_car_state: Mapping[str, Any] | None,
         error: BaseException | None = None,
+        failure_stage: str | None = None,
+        failure_reason: str | None = None,
         **extra: Any,
     ) -> None:
-        summary = self._summary(status, archived_eeg_windows, final_car_state, error)
-        summary.update(extra)
-        (self.directory / "summary.json").write_text(
-            json.dumps(_json_safe(summary), ensure_ascii=False, indent=2), encoding="utf-8"
+        if self._closed:
+            return
+        normalised_status = {
+            "finished": "completed",
+            "stopped": "aborted",
+            "closed": "aborted",
+        }.get(status, status)
+        if normalised_status not in {"completed", "aborted", "failed"}:
+            normalised_status = "failed" if error else "aborted"
+        summary = self._summary(
+            normalised_status,
+            archived_eeg_windows,
+            final_car_state,
+            error,
+            failure_stage=failure_stage,
+            failure_reason=failure_reason,
         )
-        self._events.close()
-        self._trials_file.close()
-        self._intervals_file.close()
+        summary.update(extra)
+        try:
+            self._write_summary_atomic(summary)
+        finally:
+            self._closed = True
+            self._events.close()
+            self._trials_file.close()
+            self._intervals_file.close()
+
+    def _write_summary_atomic(self, summary: Mapping[str, Any]) -> None:
+        target = self.directory / "summary.json"
+        temporary = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=self.directory, suffix=".json.tmp", delete=False
+        )
+        temporary_path = Path(temporary.name)
+        try:
+            with temporary:
+                temporary.write(json.dumps(_json_safe(summary), ensure_ascii=False, indent=2))
+                temporary.flush()
+            os.replace(temporary_path, target)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
 
     def _summary(
-        self, status: str, archived_eeg_windows: int, final_car_state: Mapping[str, Any] | None, error: BaseException | None
+        self,
+        status: str,
+        archived_eeg_windows: int,
+        final_car_state: Mapping[str, Any] | None,
+        error: BaseException | None,
+        *,
+        failure_stage: str | None,
+        failure_reason: str | None,
     ) -> dict[str, Any]:
         completed = [row for row in self.rows if row.get("trial_status") == "completed"]
+        failed = [row for row in self.rows if row.get("trial_status") == "failed"]
         decoded = [row for row in self.rows if row.get("predicted_frequency_hz") is not None]
         correct_values = [bool(row.get("correct")) for row in decoded if row.get("correct") is not None]
         per_frequency: dict[str, float | None] = {}
@@ -228,15 +320,28 @@ class UnifiedSessionLogger:
             {field: row.get(field) for field in live_alignment_fields}
             for row in self.rows if row.get("source_mode") == "live"
         ]
+        ended_monotonic_s = time.monotonic()
+        ended_utc = datetime.now(timezone.utc).isoformat()
+        controller_final_state = (
+            final_car_state.get("controller_state") if final_car_state is not None else None
+        )
+        stable_failure_reason = failure_reason or (_error_reason(error) if error else None)
         return {
             **self.metadata,
             "source_replay_file": self.metadata.get("source_replay_file"),
             "source_session": self.metadata.get("source_session"),
             "status": status,
-            "finished_utc": datetime.now(timezone.utc).isoformat(),
-            "duration_s": time.monotonic() - self.started_monotonic_s,
+            "session_status": status,
+            "session_failure_stage": failure_stage if status == "failed" else None,
+            "session_failure_reason": stable_failure_reason if status == "failed" else None,
+            "finished_utc": ended_utc,
+            "session_ended_utc": ended_utc,
+            "session_ended_monotonic_s": ended_monotonic_s,
+            "duration_s": ended_monotonic_s - self.started_monotonic_s,
+            "session_duration_s": ended_monotonic_s - self.started_monotonic_s,
             "total_attempts": len(self.rows),
             "completed_trials": len(completed),
+            "failed_trials": len(failed),
             "aborted_trials": sum(row.get("trial_status") == "aborted" for row in self.rows),
             "stopped_trials": sum(row.get("trial_status") == "stopped" for row in self.rows),
             "archived_eeg_windows": archived_eeg_windows,
@@ -256,9 +361,34 @@ class UnifiedSessionLogger:
             "raw_input_preprocessing": "none" if self.metadata.get("mode") == "live" else None,
             "live_alignment_trials": live_alignment_trials,
             "final_car_state": dict(final_car_state) if final_car_state is not None else None,
+            "controller_type": self.metadata.get("controller_type"),
+            "controller_device_name": self.metadata.get("car_device_name"),
+            "controller_device_id": self.metadata.get("car_device_id"),
+            "controller_connected": bool(self.metadata.get("controller_connected", False)),
+            "controller_connect_latency_ms": self.metadata.get("controller_connect_latency_ms"),
+            "controller_initial_state": self.metadata.get("controller_initial_state"),
+            "controller_final_state": controller_final_state,
+            "controller_last_error": (
+                final_car_state.get("last_error") if final_car_state is not None else None
+            ),
+            "controller_requested_command_count": self._controller_counts["requested"],
+            "controller_queued_command_count": self._controller_counts["queued"],
+            "controller_sent_command_count": self._controller_counts["sent"],
+            "controller_failed_command_count": self._controller_counts["failed"],
+            "controller_coalesced_command_count": self._controller_counts["coalesced"],
+            "controller_stop_requested_count": self._controller_counts["stop_requested"],
+            "controller_event_overflow_count": int(self.metadata.get("controller_event_overflow_count", 0)),
+            "cleanup_error_count": int(self.metadata.get("cleanup_error_count", 0)),
             "error_type": type(error).__name__ if error else None,
             "error_message": str(error)[:500] if error else None,
         }
+
+
+def _error_reason(error: BaseException | None) -> str | None:
+    if error is None:
+        return None
+    message = str(error).strip()
+    return type(error).__name__ if not message else f"{type(error).__name__}: {message[:400]}"
 
 
 def _finite_values(values: Sequence[Any] | Any) -> list[float]:

@@ -13,9 +13,12 @@ from typing import Any, Callable, Sequence
 from .config import ControllerConfig, DemoConfig
 from .control import DispatchDecision, SafeCommandDispatcher
 from .controller_factory import (
+    ControllerFaultError,
     ControllerRuntime,
-    cleanup_controller,
+    ControllerStartupError,
     create_controller,
+    drain_controller_events,
+    finalize_session,
     log_controller_connected,
 )
 from .decoders import CCADecoder, FFTDecoder, SSVEPDecoder
@@ -51,6 +54,16 @@ class LiveDemoState(str, Enum):
     PAUSED = "PAUSED"
     FINISHED = "FINISHED"
     STOPPED = "STOPPED"
+
+
+def _window_close_requested(win: Any) -> bool:
+    if bool(getattr(win, "closed", False)):
+        return True
+    handle = getattr(win, "winHandle", None)
+    return bool(
+        handle is not None
+        and (getattr(handle, "has_exit", False) or getattr(handle, "_closed", False))
+    )
 
 
 class LiveDemoStateMachine:
@@ -299,19 +312,88 @@ class SSVEPLiveDemoRunner:
     def _decoder(self) -> SSVEPDecoder:
         return FFTDecoder(self.config) if self.decoder_type == "fft" else CCADecoder(self.config)
 
-    def _create_controller_runtime(self) -> ControllerRuntime:
+    def _create_controller_runtime(self, logger: UnifiedSessionLogger | None = None) -> ControllerRuntime:
         if self._controller_runtime_factory is not None:
-            return self._controller_runtime_factory()
-        return create_controller(self.config.controller, mode="live")
+            started = time.monotonic()
+            if logger is not None:
+                logger.event("controller_connect_started", controller_type=self.config.controller.type)
+            try:
+                runtime = self._controller_runtime_factory()
+            except BaseException as exc:
+                if logger is not None:
+                    logger.event(
+                        "controller_connect_failed",
+                        controller_type=self.config.controller.type,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc)[:500],
+                    )
+                raise
+            runtime.connected = runtime.virtual_car is not None or runtime.state == "READY"
+            runtime.connect_latency_ms = (time.monotonic() - started) * 1000.0
+            runtime.initial_state = runtime.initial_state or runtime.state
+            return runtime
+        return create_controller(self.config.controller, mode="live", logger=logger)
+
+    def _create_session(self) -> tuple[UnifiedSessionLogger, EEGWindowArchiveWriter]:
+        effective_config = resolved_config_dict(
+            self.config,
+            decoder_type=self.decoder_type,
+            confirmations_required=self.control_config.confirmations_required,
+        )
+        effective_config["stimulus"]["fullscreen"] = self.fullscreen
+        effective_config["runtime"] = {
+            "refresh_rate_hz": self.refresh_rate_override_hz,
+            "source": "omnibci-websocket",
+            "server_url": self.server_url,
+        }
+        bluetooth = self.config.controller.bluetooth
+        logger = UnifiedSessionLogger(
+            self.output_dir,
+            effective_config,
+            {
+                "mode": "live",
+                "source": "omnibci-websocket",
+                "server_url": self.server_url,
+                "decoder_type": self.decoder_type,
+                "real_eeg_software_path_complete": True,
+                "human_ssvep_validated": False,
+                "hardware_sync_validated": False,
+                "real_car_validated": False,
+                "controller_type": self.config.controller.type,
+                "car_device_name": bluetooth.device_name if self.config.controller.type == "bluetooth" else None,
+                "car_device_id": bluetooth.device_id if self.config.controller.type == "bluetooth" else None,
+                "car_connect_timeout_s": bluetooth.connect_timeout_s if self.config.controller.type == "bluetooth" else None,
+                "controller_connected": False,
+                "controller_initial_state": "DISCONNECTED" if self.config.controller.type == "bluetooth" else "READY",
+            },
+        )
+        archive = EEGWindowArchiveWriter(
+            logger.directory / "eeg_windows.npz",
+            self.config.acquisition.channels,
+            self.config.live.trial_samples,
+        )
+        return logger, archive
 
     def run(self) -> Path:
+        logger, archive = self._create_session()
+        controller_runtime: ControllerRuntime | None = None
+        dispatcher: SafeCommandDispatcher | None = None
+        win: Any | None = None
+        error: BaseException | None = None
+        failure_stage: str | None = None
+        failure_reason: str | None = None
+        status = "failed"
         try:
-            import psychopy
-            from psychopy import event, visual
-        except ImportError as exc:  # pragma: no cover - GUI dependency
-            raise RuntimeError("PsychoPy is required for live mode. Install the 'stimulus' extra.") from exc
-        controller_runtime = self._create_controller_runtime()
-        try:
+            failure_stage = "controller_connect"
+            controller_runtime = self._create_controller_runtime(logger)
+            log_controller_connected(logger, controller_runtime)
+            failure_stage = "psychopy_import"
+            try:
+                import psychopy
+                from psychopy import event, visual
+            except ImportError as exc:  # pragma: no cover - GUI dependency
+                raise RuntimeError("PsychoPy is required for live mode. Install the 'stimulus' extra.") from exc
+            failure_stage = "window_create"
             win = visual.Window(
                 size=self.config.stimulus.window_size,
                 fullscr=self.fullscreen,
@@ -320,14 +402,7 @@ class SSVEPLiveDemoRunner:
                 units="norm",
                 waitBlanking=True,
             )
-        except BaseException:
-            cleanup_controller(None, controller_runtime)
-            raise
-        logger: UnifiedSessionLogger | None = None
-        archive: EEGWindowArchiveWriter | None = None
-        dispatcher: SafeCommandDispatcher | None = None
-        error: BaseException | None = None
-        try:
+            failure_stage = "runtime_setup"
             font = resolve_cjk_font(
                 None, None, self.config.ui.cjk_font_file, self.config.ui.cjk_font_name,
                 config_directory=self.config_path.expanduser().resolve().parent,
@@ -340,79 +415,60 @@ class SSVEPLiveDemoRunner:
             planned_frames = max(1, round(self.config.stimulus.trial_duration_s * refresh_hz))
             sequences = planned_flicker_sequences(self.config.stimulus.frequencies_hz, refresh_hz, planned_frames)
             estimates = {frequency: estimate_effective_frequency_hz(sequence, refresh_hz) for frequency, sequence in sequences.items()}
-            effective_config = resolved_config_dict(
-                self.config, decoder_type=self.decoder_type,
-                confirmations_required=self.control_config.confirmations_required,
-            )
-            effective_config["stimulus"]["fullscreen"] = self.fullscreen
-            effective_config["runtime"] = {
-                "refresh_rate_hz": self.refresh_rate_override_hz,
-                "source": "omnibci-websocket",
-                "server_url": self.server_url,
-            }
-            logger = UnifiedSessionLogger(
-                self.output_dir,
-                effective_config,
-                {
-                    "mode": "live",
-                    "source": "omnibci-websocket",
-                    "server_url": self.server_url,
-                    "decoder_type": self.decoder_type,
-                    "psychopy_version": psychopy.__version__,
-                    "measured_refresh_rate_hz": refresh_hz,
-                    "refresh_rate_source": refresh_source,
-                    "real_eeg_software_path_complete": True,
-                    "human_ssvep_validated": False,
-                    "hardware_sync_validated": False,
-                    "real_car_validated": False,
-                    **controller_runtime.metadata(),
-                },
-            )
-            log_controller_connected(logger, controller_runtime)
-            archive = EEGWindowArchiveWriter(
-                logger.directory / "eeg_windows.npz", self.config.acquisition.channels, self.config.live.trial_samples
+            logger.update_metadata(
+                psychopy_version=psychopy.__version__,
+                measured_refresh_rate_hz=refresh_hz,
+                refresh_rate_source=refresh_source,
             )
             dispatcher = SafeCommandDispatcher(controller_runtime.controller, self.control_config, self.config.commands)
             coordinator = LiveTrialCoordinator(self._decoder(), dispatcher)
             view = _LiveDemoView(win, visual, self.config, font, estimates)
             self.live_source.start()
             logger.event("live_source_started", server_url=self.server_url)
+            logger.event("session_running", session_status="running")
+            failure_stage = "trial_runtime"
             self._run_loop(
                 win, event, view, logger, archive, coordinator, dispatcher, controller_runtime, refresh_hz, nominal_interval_s
             )
-            logger.event("session_finished" if self.state_machine.state is LiveDemoState.FINISHED else "session_stopped")
+            failed_rows = [row for row in logger.rows if row.get("trial_status") == "failed"]
+            if failed_rows:
+                status = "failed"
+                failure_stage = "live_eeg"
+                failure_reason = str(
+                    failed_rows[-1].get("live_window_failure_reason") or "one or more live EEG trials failed"
+                )[:500]
+            else:
+                status = "completed" if self.state_machine.state is LiveDemoState.FINISHED else "aborted"
             return logger.directory
+        except KeyboardInterrupt as exc:
+            error = exc
+            status = "aborted"
+            failure_stage = "user_interrupt"
+            raise
         except BaseException as exc:
             error = exc
-            if logger is not None:
-                logger.event("session_failed", error_type=type(exc).__name__, error_message=str(exc)[:500])
+            status = "failed"
+            if isinstance(exc, ControllerStartupError):
+                controller_runtime = controller_runtime or exc.runtime
+                failure_stage = "controller_connect"
+            elif isinstance(exc, ControllerFaultError):
+                failure_stage = "controller_fault"
+            else:
+                failure_stage = getattr(exc, "session_failure_stage", failure_stage)
             raise
         finally:
-            cleanup_error: BaseException | None = None
-            try:
-                self.live_source.abort_trial("runner_shutdown")
-            except BaseException as exc:
-                cleanup_error = exc
-            controller_error = cleanup_controller(dispatcher, controller_runtime, logger)
-            cleanup_error = cleanup_error or controller_error
-            try:
-                self.live_source.close()
-            except BaseException as exc:
-                cleanup_error = cleanup_error or exc
-            if logger is not None:
-                try:
-                    logger.close(
-                        status="failed" if error or cleanup_error else self.state_machine.state.value.lower(),
-                        archived_eeg_windows=archive.count if archive is not None else 0,
-                        final_car_state=controller_runtime.snapshot(),
-                        error=error or cleanup_error,
-                    )
-                except BaseException as exc:
-                    cleanup_error = cleanup_error or exc
-            try:
-                win.close()
-            except BaseException as exc:
-                cleanup_error = cleanup_error or exc
+            cleanup_error = finalize_session(
+                logger=logger,
+                archive=archive,
+                runtime=controller_runtime,
+                dispatcher=dispatcher,
+                status=status,
+                error=error,
+                failure_stage=failure_stage,
+                failure_reason=failure_reason,
+                live_source=self.live_source,
+                window=win,
+            )
             if error is None and cleanup_error is not None:
                 raise cleanup_error
 
@@ -444,10 +500,25 @@ class SSVEPLiveDemoRunner:
         previous_frame_s = time.monotonic()
 
         while self.state_machine.state not in {LiveDemoState.FINISHED, LiveDemoState.STOPPED}:
+            drain_controller_events(controller, logger)
             try:
                 controller.ensure_healthy()
             except BaseException as exc:
-                logger.event("controller_fault", controller_state=controller.state, error_message=str(exc)[:500])
+                self.live_source.abort_trial("controller_fault")
+                try:
+                    dispatcher.stop(reason="controller_fault")
+                except BaseException:
+                    pass
+                if record is not None:
+                    self._finish_record(
+                        record, controller, self.live_source.status(), "failed", "controller_fault"
+                    )
+                    logger.trial(record)
+                    record = None
+                if not callable(getattr(controller.controller, "poll_events", None)):
+                    logger.event(
+                        "controller_fault", controller_state=controller.state, error_message=str(exc)[:500]
+                    )
                 raise
             self.live_source.poll()
             for source_event in self.live_source.take_events():
@@ -483,16 +554,18 @@ class SSVEPLiveDemoRunner:
             delta_s = max(0.0, now_s - frame_start_s)
             previous_frame_s = now_s
             keys = event.getKeys(keyList=["return", "p", "escape"])
-            if "escape" in keys:
-                self.live_source.abort_trial("escape")
-                dispatcher.stop(now_s, reason="escape")
+            close_requested = _window_close_requested(win)
+            if "escape" in keys or close_requested:
+                stop_reason = "window_closed" if close_requested else "escape"
+                self.live_source.abort_trial(stop_reason)
+                dispatcher.stop(now_s, reason=stop_reason)
                 controller.stop_virtual()
                 if record is not None:
                     self._finish_record(record, controller, self.live_source.status(), "stopped")
                     logger.trial(record)
                     record = None
                 self.state_machine.stop()
-                logger.event("session_stopped", reason="escape")
+                logger.event("session_stop_requested", reason=stop_reason)
                 continue
             if "p" in keys:
                 if self.state_machine.state is LiveDemoState.PAUSED:
@@ -644,7 +717,7 @@ class SSVEPLiveDemoRunner:
                     dispatcher.stop(now_s, reason=failure)
                     controller.stop_virtual()
                     self._apply_live_fields(record, status, "incomplete_live_window", failure)
-                    self._finish_record(record, controller, status, "aborted", failure)
+                    self._finish_record(record, controller, status, "failed", failure)
                     self.state_machine.collection_failed()
                     rest_start_s = None
                     logger.event("live_window_failed", trial_id=trial.trial_id, attempt_id=record["attempt_id"], reason=failure)
@@ -658,14 +731,30 @@ class SSVEPLiveDemoRunner:
                     computation = coordinator.process(window)
                 except BaseException as exc:
                     try:
+                        dispatcher.stop(reason="decoder_failure")
+                    except BaseException:
+                        pass
+                    self.live_source.abort_trial("decoder_failure")
+                    self._finish_record(
+                        record, controller, self.live_source.status(), "failed", "decoder_failure"
+                    )
+                    logger.trial(record)
+                    record = None
+                    try:
                         controller.ensure_healthy()
                     except BaseException as fault:
-                        logger.event(
-                            "controller_fault",
-                            controller_state=controller.state,
-                            error_message=str(fault)[:500],
-                        )
+                        drain_controller_events(controller, logger)
+                        if not callable(getattr(controller.controller, "poll_events", None)):
+                            logger.event(
+                                "controller_fault",
+                                controller_state=controller.state,
+                                error_message=str(fault)[:500],
+                            )
                         raise fault from exc
+                    try:
+                        setattr(exc, "session_failure_stage", "decoder")
+                    except BaseException:
+                        pass
                     raise
                 result, decision = computation.result, computation.decision
                 record.update(
@@ -682,7 +771,9 @@ class SSVEPLiveDemoRunner:
                     dispatcher_reason=decision.reason,
                     car_start_x=car_start["x"], car_start_y=car_start["y"],
                     car_start_heading=car_start["heading_degrees"],
+                    **controller.trial_controller_fields(decision),
                 )
+                drain_controller_events(controller, logger)
                 if decision.action == "executed":
                     record["execution_start_monotonic_s"] = decision.timestamp_s
                 else:
@@ -738,7 +829,7 @@ class SSVEPLiveDemoRunner:
                 win.flip()
                 if now_s - rest_start_s >= self.config.stimulus.rest_duration_s:
                     assert record is not None
-                    if record.get("trial_status") != "aborted":
+                    if record.get("trial_status") not in {"aborted", "failed", "stopped"}:
                         self._finish_record(record, controller, self.live_source.status(), "completed")
                     logger.trial(record)
                     logger.event("trial_completed", trial_id=trial.trial_id, attempt_id=record["attempt_id"], status=record["trial_status"])
@@ -811,6 +902,8 @@ class SSVEPLiveDemoRunner:
         failure_reason: str | None = None,
     ) -> None:
         record["trial_status"] = trial_status
+        for key, value in controller.trial_controller_fields(None).items():
+            record.setdefault(key, value)
         if failure_reason is not None:
             self._apply_live_fields(record, status, "incomplete_live_window", failure_reason)
         position = controller.position()

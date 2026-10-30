@@ -635,3 +635,37 @@ def test_escape_aborts_live_trial_and_stops_controller() -> None:
     assert runner.state_machine.state is LiveDemoState.STOPPED
     assert source.status().trial_failure_reason == "escape"
     assert not car.is_moving
+
+
+def test_window_close_aborts_live_trial_and_stops_controller() -> None:
+    from ssvep_demo.control import SafeCommandDispatcher
+    from ssvep_demo.virtual_car import VirtualCarController
+
+    source = _ready_source()
+    _begin(source, 0)
+    runner = SSVEPLiveDemoRunner(
+        CONFIG, CONFIG_PATH, server_url="ws://127.0.0.1:8766/v1/stream", max_trials=1, live_source=source
+    )
+
+    class NoKeysEvent:
+        @staticmethod
+        def getKeys(**_kwargs):
+            return []
+
+    class ClosedWindow:
+        closed = True
+
+    class Logger:
+        def event(self, *_args, **_kwargs):
+            pass
+
+    car = VirtualCarController()
+    car.execute(CONFIG.commands[12.0])
+    dispatcher = SafeCommandDispatcher(car, CONFIG.control, CONFIG.commands)
+    runner._run_loop(
+        ClosedWindow(), NoKeysEvent(), None, Logger(), None, None, dispatcher, car, 60.0, 1 / 60.0
+    )
+
+    assert runner.state_machine.state is LiveDemoState.STOPPED
+    assert source.status().trial_failure_reason == "window_closed"
+    assert not car.is_moving

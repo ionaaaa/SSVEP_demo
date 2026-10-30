@@ -19,9 +19,12 @@ from typing import Any, Callable, Protocol, Sequence
 from .config import ControllerConfig, DemoConfig
 from .control import ControlConfig, DispatchDecision, SafeCommandDispatcher
 from .controller_factory import (
+    ControllerFaultError,
     ControllerRuntime,
-    cleanup_controller,
+    ControllerStartupError,
     create_controller,
+    drain_controller_events,
+    finalize_session,
     log_controller_connected,
 )
 from .decoders import CCADecoder, FFTDecoder, SSVEPDecoder
@@ -56,6 +59,16 @@ class SyntheticDemoState(str, Enum):
     PAUSED = "PAUSED"
     FINISHED = "FINISHED"
     STOPPED = "STOPPED"
+
+
+def _window_close_requested(win: Any) -> bool:
+    if bool(getattr(win, "closed", False)):
+        return True
+    handle = getattr(win, "winHandle", None)
+    return bool(
+        handle is not None
+        and (getattr(handle, "has_exit", False) or getattr(handle, "_closed", False))
+    )
 
 
 class SyntheticDemoStateMachine:
@@ -340,21 +353,88 @@ class SSVEPSyntheticDemoRunner:
     def _make_decoder(self) -> SSVEPDecoder:
         return FFTDecoder(self.config) if self.decoder_type == "fft" else CCADecoder(self.config)
 
-    def _create_controller_runtime(self) -> ControllerRuntime:
+    def _create_controller_runtime(self, logger: UnifiedSessionLogger | None = None) -> ControllerRuntime:
         if self._controller_runtime_factory is not None:
-            return self._controller_runtime_factory()
-        return create_controller(self.config.controller, mode="synthetic")
+            started = time.monotonic()
+            if logger is not None:
+                logger.event("controller_connect_started", controller_type=self.config.controller.type)
+            try:
+                runtime = self._controller_runtime_factory()
+            except BaseException as exc:
+                if logger is not None:
+                    logger.event(
+                        "controller_connect_failed",
+                        controller_type=self.config.controller.type,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc)[:500],
+                    )
+                raise
+            runtime.connected = runtime.virtual_car is not None or runtime.state == "READY"
+            runtime.connect_latency_ms = (time.monotonic() - started) * 1000.0
+            runtime.initial_state = runtime.initial_state or runtime.state
+            return runtime
+        return create_controller(self.config.controller, mode="synthetic", logger=logger)
+
+    def _create_session(self, *, no_gui: bool) -> tuple[UnifiedSessionLogger, EEGWindowArchiveWriter]:
+        effective_config = resolved_config_dict(
+            self.config,
+            decoder_type=self.decoder_type,
+            synthetic_snr_db=self.snr_db,
+            synthetic_seed=self.seed,
+            confirmations_required=self.control_config.confirmations_required,
+        )
+        effective_config["stimulus"]["fullscreen"] = self.fullscreen
+        effective_config["runtime"] = {"no_gui": no_gui, "refresh_rate_hz": self.refresh_rate_override_hz}
+        bluetooth = self.config.controller.bluetooth
+        logger = UnifiedSessionLogger(
+            self.output_dir,
+            effective_config,
+            {
+                "mode": "synthetic",
+                "synthetic_source_uses_trial_target": True,
+                "real_eeg_validated": False,
+                "real_car_validated": False,
+                "decoder_type": self.decoder_type,
+                "snr_db": self.snr_db,
+                "synthetic_seed": self.seed,
+                "confirmations_required": self.control_config.confirmations_required,
+                "controller_type": self.config.controller.type,
+                "car_device_name": bluetooth.device_name if self.config.controller.type == "bluetooth" else None,
+                "car_device_id": bluetooth.device_id if self.config.controller.type == "bluetooth" else None,
+                "car_connect_timeout_s": bluetooth.connect_timeout_s if self.config.controller.type == "bluetooth" else None,
+                "controller_connected": False,
+                "controller_initial_state": "DISCONNECTED" if self.config.controller.type == "bluetooth" else "READY",
+            },
+        )
+        archive = EEGWindowArchiveWriter(
+            logger.directory / "eeg_windows.npz",
+            self.config.acquisition.channels,
+            int(round(self.config.stimulus.trial_duration_s * self.config.acquisition.sample_rate_hz)),
+        )
+        return logger, archive
 
     def run(self) -> Path:
         """Create a window only on explicit entry and run the simulated pipeline."""
+        logger, archive = self._create_session(no_gui=False)
+        controller_runtime: ControllerRuntime | None = None
+        dispatcher: SafeCommandDispatcher | None = None
+        win: Any | None = None
+        error: BaseException | None = None
+        failure_stage: str | None = None
+        status = "failed"
         try:
-            import psychopy
-            from psychopy import event, visual
-        except ImportError as exc:  # pragma: no cover - local GUI dependency
-            raise RuntimeError("PsychoPy is required for the synthetic demo. Install the 'stimulus' extra.") from exc
-
-        controller_runtime = self._create_controller_runtime()
-        try:
+            failure_stage = "controller_connect"
+            controller_runtime = self._create_controller_runtime(logger)
+            log_controller_connected(logger, controller_runtime)
+            failure_stage = "psychopy_import"
+            try:
+                import psychopy
+                from psychopy import event, visual
+            except ImportError as exc:  # pragma: no cover - local GUI dependency
+                raise RuntimeError(
+                    "PsychoPy is required for the synthetic demo. Install the 'stimulus' extra."
+                ) from exc
+            failure_stage = "window_create"
             win = visual.Window(
                 size=self.config.stimulus.window_size,
                 fullscr=self.fullscreen,
@@ -363,14 +443,7 @@ class SSVEPSyntheticDemoRunner:
                 units="norm",
                 waitBlanking=True,
             )
-        except BaseException:
-            cleanup_controller(None, controller_runtime)
-            raise
-        logger: UnifiedSessionLogger | None = None
-        archive: EEGWindowArchiveWriter | None = None
-        dispatcher: SafeCommandDispatcher | None = None
-        error: BaseException | None = None
-        try:
+            failure_stage = "runtime_setup"
             font = resolve_cjk_font(
                 None,
                 None,
@@ -386,41 +459,13 @@ class SSVEPSyntheticDemoRunner:
             planned_frames = max(1, round(self.config.stimulus.trial_duration_s * refresh_hz))
             sequences = planned_flicker_sequences(self.config.stimulus.frequencies_hz, refresh_hz, planned_frames)
             estimates = {frequency: estimate_effective_frequency_hz(sequence, refresh_hz) for frequency, sequence in sequences.items()}
-            effective_config = resolved_config_dict(
-                self.config,
-                decoder_type=self.decoder_type,
-                synthetic_snr_db=self.snr_db,
-                synthetic_seed=self.seed,
-                confirmations_required=self.control_config.confirmations_required,
-            )
-            effective_config["stimulus"]["fullscreen"] = self.fullscreen
-            effective_config["runtime"] = {"refresh_rate_hz": self.refresh_rate_override_hz}
-            logger = UnifiedSessionLogger(
-                self.output_dir,
-                effective_config,
-                {
-                    "mode": "synthetic",
-                    "synthetic_source_uses_trial_target": True,
-                    "real_eeg_validated": False,
-                    "real_car_validated": False,
-                    "psychopy_version": psychopy.__version__,
-                    "measured_refresh_rate_hz": refresh_hz,
-                    "refresh_rate_source": refresh_source,
-                    "decoder_type": self.decoder_type,
-                    "snr_db": self.snr_db,
-                    "synthetic_seed": self.seed,
-                    "confirmations_required": self.control_config.confirmations_required,
-                    "requested_frequencies_hz": list(self.config.stimulus.frequencies_hz),
-                    "estimated_frequencies_hz": estimates,
-                    "effective_frequency_estimation": "off_to_on_rising_edges / planned_duration",
-                    **controller_runtime.metadata(),
-                },
-            )
-            log_controller_connected(logger, controller_runtime)
-            archive = EEGWindowArchiveWriter(
-                logger.directory / "eeg_windows.npz",
-                self.config.acquisition.channels,
-                int(round(self.config.stimulus.trial_duration_s * self.config.acquisition.sample_rate_hz)),
+            logger.update_metadata(
+                psychopy_version=psychopy.__version__,
+                measured_refresh_rate_hz=refresh_hz,
+                refresh_rate_source=refresh_source,
+                requested_frequencies_hz=list(self.config.stimulus.frequencies_hz),
+                estimated_frequencies_hz=estimates,
+                effective_frequency_estimation="off_to_on_rising_edges / planned_duration",
             )
             print("SIMULATION MODE: EEG is synthesized from each trial target; this is not real human SSVEP.")
             print("No real EEG or real car has been validated.")
@@ -432,32 +477,40 @@ class SSVEPSyntheticDemoRunner:
                 self.config, self._make_decoder(), dispatcher, snr_db=self.snr_db, seed=self.seed
             )
             view = _SyntheticDemoView(win, visual, self.config, font, estimates)
+            logger.event("session_running", session_status="running")
+            failure_stage = "trial_runtime"
             self._run_loop(
                 win, visual, event, view, logger, archive, coordinator, dispatcher, controller_runtime, refresh_hz, nominal_interval_s
             )
-            logger.event("session_finished" if self.state_machine.state is SyntheticDemoState.FINISHED else "session_stopped")
+            status = "completed" if self.state_machine.state is SyntheticDemoState.FINISHED else "aborted"
             return logger.directory
+        except KeyboardInterrupt as exc:
+            error = exc
+            status = "aborted"
+            failure_stage = "user_interrupt"
+            raise
         except BaseException as exc:
             error = exc
-            if logger is not None:
-                logger.event("session_failed", error_type=type(exc).__name__, error_message=str(exc)[:500])
+            status = "failed"
+            if isinstance(exc, ControllerStartupError):
+                controller_runtime = controller_runtime or exc.runtime
+                failure_stage = "controller_connect"
+            elif isinstance(exc, ControllerFaultError):
+                failure_stage = "controller_fault"
+            else:
+                failure_stage = getattr(exc, "session_failure_stage", failure_stage)
             raise
         finally:
-            cleanup_error = cleanup_controller(dispatcher, controller_runtime, logger)
-            if logger is not None:
-                try:
-                    logger.close(
-                        status=("failed" if error or cleanup_error else self.state_machine.state.value.lower()),
-                        archived_eeg_windows=archive.count if archive is not None else 0,
-                        final_car_state=controller_runtime.snapshot(),
-                        error=error or cleanup_error,
-                    )
-                except BaseException as exc:
-                    cleanup_error = cleanup_error or exc
-            try:
-                win.close()
-            except BaseException as exc:
-                cleanup_error = cleanup_error or exc
+            cleanup_error = finalize_session(
+                logger=logger,
+                archive=archive,
+                runtime=controller_runtime,
+                dispatcher=dispatcher,
+                status=status,
+                error=error,
+                failure_stage=failure_stage,
+                window=win,
+            )
             if error is None and cleanup_error is not None:
                 raise cleanup_error
 
@@ -467,40 +520,12 @@ class SSVEPSyntheticDemoRunner:
         This is intentionally an acceptance/batch path: it does not claim to
         present a visual stimulus or create display-aligned markers.
         """
-        controller_runtime = self._create_controller_runtime()
-        logger: UnifiedSessionLogger | None = None
-        archive: EEGWindowArchiveWriter | None = None
+        logger, archive = self._create_session(no_gui=True)
+        controller_runtime: ControllerRuntime | None = None
         dispatcher: SafeCommandDispatcher | None = None
         try:
-            effective_config = resolved_config_dict(
-                self.config,
-                decoder_type=self.decoder_type,
-                synthetic_snr_db=self.snr_db,
-                synthetic_seed=self.seed,
-                confirmations_required=self.control_config.confirmations_required,
-            )
-            effective_config["runtime"] = {"no_gui": True}
-            logger = UnifiedSessionLogger(
-                self.output_dir,
-                effective_config,
-                {
-                    "mode": "synthetic",
-                    "synthetic_source_uses_trial_target": True,
-                    "real_eeg_validated": False,
-                    "real_car_validated": False,
-                    "decoder_type": self.decoder_type,
-                    "snr_db": self.snr_db,
-                    "synthetic_seed": self.seed,
-                    "confirmations_required": self.control_config.confirmations_required,
-                    **controller_runtime.metadata(),
-                },
-            )
+            controller_runtime = self._create_controller_runtime(logger)
             log_controller_connected(logger, controller_runtime)
-            archive = EEGWindowArchiveWriter(
-                logger.directory / "eeg_windows.npz",
-                self.config.acquisition.channels,
-                int(round(self.config.stimulus.trial_duration_s * self.config.acquisition.sample_rate_hz)),
-            )
             dispatcher = SafeCommandDispatcher(
                 controller_runtime.controller, self.control_config, self.config.commands
             )
@@ -508,22 +533,24 @@ class SSVEPSyntheticDemoRunner:
                 self.config, self._make_decoder(), dispatcher, snr_db=self.snr_db, seed=self.seed
             )
         except BaseException as setup_error:
-            cleanup_controller(dispatcher, controller_runtime, logger)
-            if logger is not None:
-                try:
-                    logger.close(
-                        status="failed",
-                        archived_eeg_windows=archive.count if archive is not None else 0,
-                        final_car_state=controller_runtime.snapshot(),
-                        error=setup_error,
-                    )
-                except BaseException:
-                    pass
+            if isinstance(setup_error, ControllerStartupError):
+                controller_runtime = controller_runtime or setup_error.runtime
+            finalize_session(
+                logger=logger,
+                archive=archive,
+                runtime=controller_runtime,
+                dispatcher=dispatcher,
+                status="failed",
+                error=setup_error,
+                failure_stage="controller_connect" if isinstance(setup_error, ControllerStartupError) else "runtime_setup",
+            )
             raise
-        assert logger is not None and archive is not None and dispatcher is not None
+        assert controller_runtime is not None and dispatcher is not None
         error: BaseException | None = None
+        status = "failed"
+        failure_stage: str | None = "trial_runtime"
         try:
-            logger.event("session_started")
+            logger.event("session_running", session_status="running")
             for trial in self.schedule:
                 controller_runtime.ensure_healthy()
                 attempt_id = self._next_attempt_id(trial.trial_id)
@@ -536,21 +563,62 @@ class SSVEPSyntheticDemoRunner:
                     try:
                         controller_runtime.ensure_healthy()
                     except BaseException as fault:
-                        logger.event(
-                            "controller_fault",
-                            controller_state=controller_runtime.state,
-                            error_message=str(fault)[:500],
+                        try:
+                            dispatcher.stop(reason="controller_fault")
+                        except BaseException:
+                            pass
+                        drain_controller_events(controller_runtime, logger)
+                        if not callable(getattr(controller_runtime.controller, "poll_events", None)):
+                            logger.event(
+                                "controller_fault",
+                                controller_state=controller_runtime.state,
+                                error_message=str(fault)[:500],
+                            )
+                        logger.trial(
+                            {
+                                "trial_id": trial.trial_id,
+                                "attempt_id": attempt_id,
+                                "mode": "synthetic",
+                                "trial_status": "failed",
+                                "target_frequency_hz": trial.target_frequency_hz,
+                                "target_command": trial.command,
+                                "dispatcher_reason": "controller_fault",
+                                **controller_runtime.trial_controller_fields(None),
+                                "controller_failure_reason": controller_runtime.last_error,
+                            }
                         )
                         raise fault from exc
+                    try:
+                        dispatcher.stop(reason="decoder_failure")
+                    except BaseException:
+                        pass
+                    logger.trial(
+                        {
+                            "trial_id": trial.trial_id,
+                            "attempt_id": attempt_id,
+                            "mode": "synthetic",
+                            "trial_status": "failed",
+                            "target_frequency_hz": trial.target_frequency_hz,
+                            "target_command": trial.command,
+                            "dispatcher_reason": "decoder_failure",
+                            **controller_runtime.trial_controller_fields(None),
+                        }
+                    )
+                    try:
+                        setattr(exc, "session_failure_stage", "decoder")
+                    except BaseException:
+                        pass
                     raise
                 try:
                     controller_runtime.ensure_healthy()
                 except BaseException as exc:
-                    logger.event(
-                        "controller_fault",
-                        controller_state=controller_runtime.state,
-                        error_message=str(exc)[:500],
-                    )
+                    drain_controller_events(controller_runtime, logger)
+                    if not callable(getattr(controller_runtime.controller, "poll_events", None)):
+                        logger.event(
+                            "controller_fault",
+                            controller_state=controller_runtime.state,
+                            error_message=str(exc)[:500],
+                        )
                     raise
                 result, decision = computation.result, computation.decision
                 window_index = archive.add(
@@ -588,27 +656,38 @@ class SSVEPSyntheticDemoRunner:
                         "car_start_heading": car_start["heading_degrees"],
                         "car_end_x": car_end["x"], "car_end_y": car_end["y"],
                         "car_end_heading": car_end["heading_degrees"],
+                        **controller_runtime.trial_controller_fields(decision),
                     }
                 )
+                drain_controller_events(controller_runtime, logger)
                 logger.event("synthetic_eeg_generated", trial_id=trial.trial_id, attempt_id=attempt_id, eeg_window_index=window_index)
                 logger.event("decode_completed", trial_id=trial.trial_id, attempt_id=attempt_id, prediction=result.predicted_frequency_hz)
                 logger.event("command_dispatched", trial_id=trial.trial_id, attempt_id=attempt_id, action=decision.action, reason=decision.reason)
                 logger.event("trial_completed", trial_id=trial.trial_id, attempt_id=attempt_id)
-            logger.event("session_finished")
+            status = "completed"
             return logger.directory
+        except KeyboardInterrupt as exc:
+            error = exc
+            status = "aborted"
+            failure_stage = "user_interrupt"
+            raise
         except BaseException as exc:
             error = exc
-            logger.event("session_failed", error_type=type(exc).__name__, error_message=str(exc)[:500])
+            if isinstance(exc, ControllerFaultError):
+                failure_stage = "controller_fault"
+            else:
+                failure_stage = getattr(exc, "session_failure_stage", failure_stage)
             raise
         finally:
-            cleanup_error = cleanup_controller(dispatcher, controller_runtime, logger)
-            try:
-                logger.close(
-                    status="failed" if error or cleanup_error else "finished", archived_eeg_windows=archive.count,
-                    final_car_state=controller_runtime.snapshot(), error=error or cleanup_error,
-                )
-            except BaseException as exc:
-                cleanup_error = cleanup_error or exc
+            cleanup_error = finalize_session(
+                logger=logger,
+                archive=archive,
+                runtime=controller_runtime,
+                dispatcher=dispatcher,
+                status=status,
+                error=error,
+                failure_stage=failure_stage,
+            )
             if error is None and cleanup_error is not None:
                 raise cleanup_error
 
@@ -642,10 +721,23 @@ class SSVEPSyntheticDemoRunner:
         previous_frame_s = time.monotonic()
 
         while self.state_machine.state not in {SyntheticDemoState.FINISHED, SyntheticDemoState.STOPPED}:
+            drain_controller_events(controller, logger)
             try:
                 controller.ensure_healthy()
             except BaseException as exc:
-                logger.event("controller_fault", controller_state=controller.state, error_message=str(exc)[:500])
+                try:
+                    dispatcher.stop(reason="controller_fault")
+                except BaseException:
+                    pass
+                if record is not None:
+                    self._finish_record(record, controller, "failed")
+                    record["controller_failure_reason"] = controller.last_error
+                    logger.trial(record)
+                    record = None
+                if not callable(getattr(controller.controller, "poll_events", None)):
+                    logger.event(
+                        "controller_fault", controller_state=controller.state, error_message=str(exc)[:500]
+                    )
                 raise
             now_s = time.monotonic()
             frame_start_s = previous_frame_s
@@ -655,15 +747,22 @@ class SSVEPSyntheticDemoRunner:
                 self.state_machine.current_trial if self.state_machine.state is not SyntheticDemoState.IDLE else None
             )
             keys = event.getKeys(keyList=["return", "p", "escape"])
-            if "escape" in keys:
+            close_requested = _window_close_requested(win)
+            if "escape" in keys or close_requested:
                 active_attempt_id = record.get("attempt_id") if record else None
-                dispatcher.stop(now_s, reason="escape")
+                stop_reason = "window_closed" if close_requested else "escape"
+                dispatcher.stop(now_s, reason=stop_reason)
                 if record is not None:
                     self._finish_record(record, controller, "stopped")
                     logger.trial(record)
                     record = None
                 self.state_machine.stop()
-                logger.event("session_stopped", trial_id=active_trial.trial_id if active_trial else None, attempt_id=active_attempt_id, reason="escape")
+                logger.event(
+                    "session_stop_requested",
+                    trial_id=active_trial.trial_id if active_trial else None,
+                    attempt_id=active_attempt_id,
+                    reason=stop_reason,
+                )
                 continue
             if "p" in keys:
                 if self.state_machine.state is SyntheticDemoState.PAUSED:
@@ -770,14 +869,28 @@ class SSVEPSyntheticDemoRunner:
                     computation = coordinator.process(trial)
                 except BaseException as exc:
                     try:
+                        dispatcher.stop(reason="decoder_failure")
+                    except BaseException:
+                        pass
+                    self._finish_record(record, controller, "failed")
+                    record["dispatcher_reason"] = "decoder_failure"
+                    logger.trial(record)
+                    record = None
+                    try:
                         controller.ensure_healthy()
                     except BaseException as fault:
-                        logger.event(
-                            "controller_fault",
-                            controller_state=controller.state,
-                            error_message=str(fault)[:500],
-                        )
+                        drain_controller_events(controller, logger)
+                        if not callable(getattr(controller.controller, "poll_events", None)):
+                            logger.event(
+                                "controller_fault",
+                                controller_state=controller.state,
+                                error_message=str(fault)[:500],
+                            )
                         raise fault from exc
+                    try:
+                        setattr(exc, "session_failure_stage", "decoder")
+                    except BaseException:
+                        pass
                     raise
                 result, decision = computation.result, computation.decision
                 record["eeg_window_index"] = archive.add(
@@ -805,7 +918,9 @@ class SSVEPSyntheticDemoRunner:
                     car_start_x=car_snapshot["x"], car_start_y=car_snapshot["y"],
                     car_start_heading=car_snapshot["heading_degrees"],
                     correct=result.predicted_frequency_hz == trial.target_frequency_hz,
+                    **controller.trial_controller_fields(decision),
                 )
+                drain_controller_events(controller, logger)
                 self.state_machine.decoding_complete()
                 execution_rendered = False
                 if decision.action == "executed":
@@ -892,6 +1007,8 @@ class SSVEPSyntheticDemoRunner:
     @staticmethod
     def _finish_record(record: dict[str, Any], controller: ControllerRuntime, status: str) -> None:
         state = controller.position()
+        for key, value in controller.trial_controller_fields(None).items():
+            record.setdefault(key, value)
         record.update(
             trial_status=status,
             car_end_x=state["x"], car_end_y=state["y"], car_end_heading=state["heading_degrees"],

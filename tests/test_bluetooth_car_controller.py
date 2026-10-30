@@ -129,6 +129,10 @@ def movement_payloads(fake: FakeAsyncBackend) -> list[bytes]:
     return [payload for name, payload in fake.calls if name == "send" and payload is not None]
 
 
+def event_types(controller: BluetoothCarController) -> list[str]:
+    return [event.event_type for event in controller.poll_events()]
+
+
 def test_module_import_does_not_load_bluetooth_sdk() -> None:
     sys.modules.pop("bluetooth_car", None)
     assert "bluetooth_car" not in sys.modules
@@ -391,6 +395,77 @@ def test_worker_operation_exception_cannot_hang_process() -> None:
     fake.wait_for(lambda calls: calls.count(("stop", b"ONF")) >= 2)
     controller.close(timeout_s=1.0)
     assert controller._thread is not None and not controller._thread.is_alive()
+
+
+def test_structured_command_events_are_polled_on_main_thread_in_delivery_order() -> None:
+    controller, fake = connected_controller()
+    controller.poll_events()  # Ignore connection and initial STOP telemetry.
+    caller_thread = threading.get_ident()
+    try:
+        controller.execute(ControlCommand.RIGHT)
+        fake.wait_for(lambda calls: ("send", b"OND") in calls)
+        events = [event for event in controller.poll_events() if event.payload_ascii == "OND"]
+        assert [event.event_type for event in events] == [
+            "controller_command_requested",
+            "controller_command_queued",
+            "controller_command_send_started",
+            "controller_command_sent",
+        ]
+        assert [event.sequence for event in events] == sorted(event.sequence for event in events)
+        assert all(event.command == "RIGHT" for event in events)
+        assert threading.get_ident() == caller_thread
+    finally:
+        close_safely(controller, fake)
+
+
+def test_latest_wins_emits_coalesced_event() -> None:
+    fake = FakeAsyncBackend()
+    fake.block_payload = b"ONA"
+    controller, fake = connected_controller(fake)
+    controller.poll_events()
+    try:
+        controller.execute(ControlCommand.FORWARD)
+        assert fake.send_started.wait(1.0)
+        controller.execute(ControlCommand.BACKWARD)
+        controller.execute(ControlCommand.LEFT)
+        events = controller.poll_events()
+        coalesced = [event for event in events if event.event_type == "controller_command_coalesced"]
+        assert coalesced and coalesced[-1].payload_ascii == "ONB"
+        assert coalesced[-1].error == "superseded_by_latest_motion"
+    finally:
+        close_safely(controller, fake)
+
+
+def test_event_mailbox_is_bounded_counts_overflow_and_preserves_stop_and_closed() -> None:
+    fake = FakeAsyncBackend()
+    fake.block_payload = b"ONA"
+    controller = BluetoothCarController(backend_factory=lambda: fake, event_capacity=8, io_timeout_s=1.0)
+    controller.connect(timeout_s=1.0)
+    controller.poll_events()
+    controller.execute(ControlCommand.FORWARD)
+    assert fake.send_started.wait(1.0)
+    for command in (ControlCommand.LEFT, ControlCommand.RIGHT) * 20:
+        controller.execute(command)
+    controller.stop()
+    fake.release_send()
+    fake.wait_for(lambda calls: calls.count(("stop", b"ONF")) >= 2)
+    controller.close(timeout_s=1.0)
+
+    events = controller.poll_events()
+    assert len(events) <= 8
+    assert controller.event_overflow_count > 0
+    assert "controller_stop_requested" in [event.event_type for event in events]
+    assert "controller_closed" in [event.event_type for event in events]
+
+
+def test_close_events_remain_drainable_after_worker_thread_is_joined() -> None:
+    controller, fake = connected_controller()
+    controller.poll_events()
+    controller.close(timeout_s=1.0)
+
+    events = controller.poll_events()
+    assert events[-1].event_type == "controller_closed"
+    assert events[-1].state == "CLOSED"
 
 
 def test_real_controller_creation_has_clear_non_windows_error(monkeypatch: pytest.MonkeyPatch) -> None:

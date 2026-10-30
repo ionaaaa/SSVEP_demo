@@ -32,7 +32,7 @@ commands:
   "15": BACKWARD
 
 control:
-  confidence_threshold: 0.60
+  confidence_threshold: 0.10
   confirmations_required: 2
   max_confirmation_gap_s: 1.0
   command_duration_s: 0.5

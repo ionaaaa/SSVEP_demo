@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+from collections import deque
+from dataclasses import dataclass
 from enum import Enum
 import importlib
 import logging
@@ -37,8 +39,32 @@ COMMAND_PAYLOADS: dict[ControlCommand, bytes] = {
     ControlCommand.RIGHT: b"OND",
     ControlCommand.STOP: b"ONF",
 }
+_PAYLOAD_TO_CONTROL_COMMAND = {payload: command for command, payload in COMMAND_PAYLOADS.items()}
 _PAYLOAD_TO_SDK_COMMAND = {
     payload: command.value.lower() for command, payload in COMMAND_PAYLOADS.items()
+}
+
+
+@dataclass(frozen=True)
+class ControllerEvent:
+    """Immutable worker-to-main-thread controller telemetry."""
+
+    sequence: int
+    event_type: str
+    monotonic_s: float
+    command: str | None
+    payload_ascii: str | None
+    state: str
+    success: bool | None
+    error: str | None
+
+
+_CRITICAL_EVENT_TYPES = {
+    "controller_fault",
+    "controller_command_failed",
+    "controller_close_failed",
+    "controller_closed",
+    "controller_stop_requested",
 }
 
 
@@ -176,6 +202,7 @@ class BluetoothCarController:
         device_id: str | None = None,
         backend_factory: BackendFactory | None = None,
         io_timeout_s: float = 3.0,
+        event_capacity: int = 256,
     ) -> None:
         if backend_factory is None and sys.platform != "win32":
             raise BluetoothControllerError(WINDOWS_REQUIREMENT)
@@ -190,6 +217,8 @@ class BluetoothCarController:
             raise ValueError("device_name must be a string or None")
         if device_id is not None and not isinstance(device_id, str):
             raise ValueError("device_id must be a string or None")
+        if isinstance(event_capacity, bool) or not isinstance(event_capacity, int) or event_capacity < 8:
+            raise ValueError("event_capacity must be an integer of at least 8")
 
         self._requested_device_name = device_name
         self._requested_device_id = device_id
@@ -203,6 +232,10 @@ class BluetoothCarController:
         self._last_error: str | None = None
         self._device_name: str | None = None
         self._device_id: str | None = None
+        self._event_capacity = event_capacity
+        self._events: deque[ControllerEvent] = deque()
+        self._event_sequence = 0
+        self._event_overflow_count = 0
 
         # Bounded mailbox: one replaceable motion slot and one reserved STOP
         # flag.  STOP therefore cannot be displaced by motion or queue fullness.
@@ -239,6 +272,18 @@ class BluetoothCarController:
         with self._lock:
             return self._device_id
 
+    @property
+    def event_overflow_count(self) -> int:
+        with self._lock:
+            return self._event_overflow_count
+
+    def poll_events(self) -> list[ControllerEvent]:
+        """Return currently available events without waiting for Bluetooth I/O."""
+        with self._lock:
+            events = list(self._events)
+            self._events.clear()
+        return events
+
     def connect(self, timeout_s: float = 10.0) -> None:
         """Connect on the worker and wait for its confirmed initial STOP."""
         timeout_s = self._positive_timeout(timeout_s, "timeout_s")
@@ -247,7 +292,7 @@ class BluetoothCarController:
                 raise BluetoothControllerError(
                     f"connect requires DISCONNECTED state, got {self._state.value}"
                 )
-            self._state = BluetoothControllerState.CONNECTING
+            self._set_state_locked(BluetoothControllerState.CONNECTING)
             self._last_error = None
             future: concurrent.futures.Future[None] = concurrent.futures.Future()
             self._connect_request = (timeout_s, future)
@@ -279,13 +324,30 @@ class BluetoothCarController:
                 raise BluetoothControllerError(
                     f"movement rejected while controller is {self._state.value}"
                 )
+            self._emit_event_locked("controller_command_requested", payload=payload)
+            if self._pending_motion is not None:
+                self._emit_event_locked(
+                    "controller_command_coalesced",
+                    payload=self._pending_motion,
+                    success=False,
+                    error="superseded_by_latest_motion",
+                )
             self._pending_motion = payload
+            self._emit_event_locked("controller_command_queued", payload=payload, success=True)
         self._wake_worker()
 
     def stop(self) -> None:
         """Request priority STOP without waiting for the current I/O call."""
         should_wake = False
         with self._lock:
+            self._emit_event_locked("controller_stop_requested", payload=COMMAND_PAYLOADS[ControlCommand.STOP])
+            if self._pending_motion is not None:
+                self._emit_event_locked(
+                    "controller_command_coalesced",
+                    payload=self._pending_motion,
+                    success=False,
+                    error="superseded_by_stop",
+                )
             self._pending_motion = None
             if self._state in {
                 BluetoothControllerState.READY,
@@ -294,6 +356,11 @@ class BluetoothCarController:
             } and not self._stop_pending and not self._stop_inflight:
                 self._stop_pending = True
                 should_wake = True
+                self._emit_event_locked(
+                    "controller_command_queued",
+                    payload=COMMAND_PAYLOADS[ControlCommand.STOP],
+                    success=True,
+                )
         if should_wake:
             self._wake_worker()
 
@@ -305,15 +372,17 @@ class BluetoothCarController:
             thread = self._thread
             if self._state is BluetoothControllerState.CLOSED:
                 return
+            self._emit_event_locked("controller_close_started")
             if thread is None or not thread.is_alive():
                 self._pending_motion = None
                 if self._state is not BluetoothControllerState.FAULT:
-                    self._state = BluetoothControllerState.CLOSED
+                    self._set_state_locked(BluetoothControllerState.CLOSED)
+                    self._emit_event_locked("controller_closed", success=True)
                 return
             if self._close_future is None:
                 self._close_future = concurrent.futures.Future()
             close_future = self._close_future
-            self._state = BluetoothControllerState.CLOSING
+            self._set_state_locked(BluetoothControllerState.CLOSING)
             self._pending_motion = None
             self._close_requested = True
             if not self._stop_pending and not self._stop_inflight:
@@ -338,9 +407,11 @@ class BluetoothCarController:
         thread.join(remaining)
         if thread.is_alive():
             error = TimeoutError(f"Bluetooth worker thread did not join within {timeout_s:.3g}s")
+            self._emit_event("controller_close_failed", success=False, error=_format_error(error))
             self._record_fault(error, request_stop=False)
             raise error
         if timeout_error is not None:
+            self._emit_event("controller_close_failed", success=False, error=_format_error(timeout_error))
             raise timeout_error
 
     def _start_worker(self) -> None:
@@ -420,7 +491,7 @@ class BluetoothCarController:
                             self._device_name = name
                             self._device_id = device_id
                             if self._state is BluetoothControllerState.CONNECTING:
-                                self._state = BluetoothControllerState.READY
+                                self._set_state_locked(BluetoothControllerState.READY)
                         if not future.done():
                             future.set_result(None)
                     continue
@@ -428,21 +499,34 @@ class BluetoothCarController:
                     if backend is None:
                         self._record_fault(RuntimeError("Bluetooth backend is unavailable"))
                         continue
+                    self._emit_event("controller_command_send_started", payload=value)
                     try:
                         await asyncio.wait_for(
                             backend.send(value), timeout=self._io_timeout_s
                         )
                     except Exception as exc:
+                        self._emit_event(
+                            "controller_command_failed", payload=value, success=False, error=_format_error(exc)
+                        )
                         self._record_fault(exc, request_stop=True)
+                    else:
+                        self._emit_event("controller_command_sent", payload=value, success=True)
                     continue
                 if kind == "stop":
+                    stop_payload = COMMAND_PAYLOADS[ControlCommand.STOP]
+                    self._emit_event("controller_command_send_started", payload=stop_payload)
                     try:
                         if backend is not None:
                             await asyncio.wait_for(
                                 backend.stop(), timeout=self._io_timeout_s
                             )
                     except Exception as exc:
+                        self._emit_event(
+                            "controller_command_failed", payload=stop_payload, success=False, error=_format_error(exc)
+                        )
                         self._record_fault(exc, request_stop=False)
+                    else:
+                        self._emit_event("controller_command_sent", payload=stop_payload, success=True)
                     finally:
                         with self._lock:
                             self._stop_inflight = False
@@ -455,10 +539,12 @@ class BluetoothCarController:
                     await asyncio.wait_for(backend.close(), timeout=self._io_timeout_s)
                 except Exception as exc:
                     cleanup_error = exc
+                    self._emit_event("controller_close_failed", success=False, error=_format_error(exc))
                     self._record_fault(exc, request_stop=False)
             with self._lock:
                 if cleanup_error is None and self._state is BluetoothControllerState.CLOSING:
-                    self._state = BluetoothControllerState.CLOSED
+                    self._set_state_locked(BluetoothControllerState.CLOSED)
+                    self._emit_event_locked("controller_closed", success=True)
 
     async def _connect_and_stop(
         self, backend: AsyncBluetoothBackend
@@ -467,7 +553,16 @@ class BluetoothCarController:
         # BluetoothCar.connect already sends ONF.  This explicit, awaited STOP
         # makes READY independent of that SDK detail and is harmless because
         # the SDK preserves its existing 150 ms minimum interval.
-        await backend.stop()
+        stop_payload = COMMAND_PAYLOADS[ControlCommand.STOP]
+        self._emit_event("controller_command_send_started", payload=stop_payload)
+        try:
+            await backend.stop()
+        except Exception as exc:
+            self._emit_event(
+                "controller_command_failed", payload=stop_payload, success=False, error=_format_error(exc)
+            )
+            raise
+        self._emit_event("controller_command_sent", payload=stop_payload, success=True)
         return name, device_id
 
     def _next_action(self, wake_event: asyncio.Event) -> tuple[str, object] | None:
@@ -520,13 +615,74 @@ class BluetoothCarController:
         should_wake = False
         with self._lock:
             self._last_error = _format_error(exc)
-            self._state = BluetoothControllerState.FAULT
+            self._set_state_locked(BluetoothControllerState.FAULT)
             self._pending_motion = None
+            self._emit_event_locked(
+                "controller_fault", success=False, error=self._last_error
+            )
             if request_stop and not self._stop_pending and not self._stop_inflight:
                 self._stop_pending = True
                 should_wake = True
         if should_wake:
             self._wake_worker()
+
+    def _set_state_locked(self, state: BluetoothControllerState) -> None:
+        if self._state is state:
+            return
+        self._state = state
+        self._emit_event_locked("controller_state_changed")
+
+    def _emit_event(
+        self,
+        event_type: str,
+        *,
+        payload: bytes | None = None,
+        success: bool | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._emit_event_locked(
+                event_type, payload=payload, success=success, error=error
+            )
+
+    def _emit_event_locked(
+        self,
+        event_type: str,
+        *,
+        payload: bytes | None = None,
+        success: bool | None = None,
+        error: str | None = None,
+    ) -> None:
+        self._event_sequence += 1
+        command = _PAYLOAD_TO_CONTROL_COMMAND.get(payload) if payload is not None else None
+        event = ControllerEvent(
+            sequence=self._event_sequence,
+            event_type=event_type,
+            monotonic_s=time.monotonic(),
+            command=command.value if command is not None else None,
+            payload_ascii=payload.decode("ascii") if payload is not None else None,
+            state=self._state.value,
+            success=success,
+            error=error,
+        )
+        if len(self._events) >= self._event_capacity:
+            noncritical_index = next(
+                (
+                    index
+                    for index, queued in enumerate(self._events)
+                    if queued.event_type not in _CRITICAL_EVENT_TYPES
+                ),
+                None,
+            )
+            if event_type not in _CRITICAL_EVENT_TYPES and noncritical_index is None:
+                self._event_overflow_count += 1
+                return
+            if noncritical_index is None:
+                self._events.popleft()
+            else:
+                del self._events[noncritical_index]
+            self._event_overflow_count += 1
+        self._events.append(event)
 
     def _finish_close_future(self) -> None:
         with self._lock:
@@ -551,5 +707,6 @@ __all__ = [
     "BluetoothCarController",
     "BluetoothControllerError",
     "BluetoothControllerState",
+    "ControllerEvent",
     "COMMAND_PAYLOADS",
 ]
